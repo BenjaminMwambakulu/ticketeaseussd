@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Jobs\ProcessUssdBooking;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -146,7 +147,13 @@ class UssdService
         cache()->put("ussd_{$sessionId}_phone", $phone, $this->sessionTtlSeconds());
 
         try {
-            $routes = DB::select('SELECT r.id, r.tenant_id, r.route_code, r.base_fare, t.name as tenant_name FROM public.routes r LEFT JOIN public.tenants t ON t.id = r.tenant_id ORDER BY r.id');
+            $routes = cache()->remember(
+                'ussd_route_options_global',
+                $this->sessionTtlSeconds(),
+                function () {
+                    return DB::select('SELECT r.id, r.tenant_id, r.route_code, r.base_fare, t.name as tenant_name FROM public.routes r LEFT JOIN public.tenants t ON t.id = r.tenant_id ORDER BY r.id');
+                }
+            );
         } catch (\Exception $e) {
             Log::error('USSD Route Fetch Error: '.$e->getMessage());
 
@@ -278,27 +285,52 @@ class UssdService
             $confirmationChoice = $this->currentInputValue($userInput);
 
             if ($confirmationChoice === '1') {
-                $bookingResult = $this->createTripBooking($sessionId, (string) $phone);
+                $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
+                $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
+                $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
+                $passengerCount = (int) cache()->get("ussd_{$sessionId}_passenger_count", 1);
 
-                if ($bookingResult === null) {
-                    return 'END Sorry, we could not complete your booking right now. Please try again later.';
+                $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
+                $selectedRoute = null;
+                foreach ($routeOptions as $route) {
+                    if ((string) ($route['id'] ?? '') === (string) $selectedRouteId) {
+                        $selectedRoute = $route;
+                        break;
+                    }
                 }
 
-                Log::info('USSD Booking Confirmed', [
-                    'session_id' => $sessionId,
-                    'phone' => $phone,
-                    'route_id' => cache()->get("ussd_{$sessionId}_selected_route_id"),
-                    'passenger_count' => cache()->get("ussd_{$sessionId}_passenger_count"),
-                    'travel_date' => cache()->get("ussd_{$sessionId}_travel_date"),
-                    'seat_label' => $bookingResult['seat_label'],
-                    'ticket_number' => $bookingResult['ticket_number'],
+                if (! $selectedRoute || ! $selectedTripId) {
+                    return 'END Your booking session has expired. Please dial again to start over.';
+                }
+
+                $passengerName = $this->resolvePassengerFullName($sessionId, (string) $phone);
+                $totalFare = (float) ($selectedRoute['base_fare'] ?? 0) * $passengerCount;
+
+                // Dispatch the heavy transaction to the background queue
+                ProcessUssdBooking::dispatch($sessionId, (string) $phone, [
+                    'route_id' => $selectedRouteId,
+                    'trip_id' => $selectedTripId,
+                    'tenant_id' => $selectedRoute['tenant_id'],
+                    'route_code' => $selectedRoute['route_code'],
+                    'travel_date' => $travelDate,
+                    'total_fare' => $totalFare,
+                    'passenger_count' => $passengerCount,
+                    'passenger_name' => $passengerName,
                 ]);
 
-                $this->recordBookingNotification($sessionId, $phone, $bookingResult);
+                Log::info('USSD Booking Dispatched to Queue', [
+                    'session_id' => $sessionId,
+                    'phone' => $phone,
+                    'trip_id' => $selectedTripId,
+                ]);
 
                 $this->clearBookingSessionData($sessionId);
 
-                return "END Booking confirmed!\nSeat: {$bookingResult['seat_label']}\nTicket: {$bookingResult['ticket_number']}\nNotification queued for SMS delivery.";
+                return "END Thank you!\n"
+                    ."Your booking is being processed.\n"
+                    ."Ticket: Pending\n"
+                    ."Seat: Pending\n"
+                    ."If SMS is delayed, dial again and select My Bookings.";
             }
 
             if ($confirmationChoice === '2') {
@@ -432,33 +464,60 @@ class UssdService
             return 'CON Booking session expired. Please select route again.';
         }
 
+        $tripCacheKey = "ussd_trip_options_route_{$selectedRouteId}_date_{$travelDate}";
+
         try {
-            $trips = DB::select(
-                'SELECT t.id,
-                        t.departure_datetime,
-                        t.status,
-                        GREATEST(COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0), 0) AS available_seats
-                                 FROM public.trips t
-                                 LEFT JOIN public.buses b ON b.id = t.bus_id
-                                 LEFT JOIN (
-                    SELECT trip_id, COUNT(*)::int AS assigned_seats
-                    FROM public.seat_assignments
-                    GROUP BY trip_id
-                                 ) sa ON sa.trip_id = t.id
-                                 WHERE t.route_id = ?
-                   AND DATE(t.departure_datetime) = ?
-                   AND t.status IN (?, ?)
-                   AND GREATEST(COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0), 0) > 0
-                                 ORDER BY t.departure_datetime',
-                [$selectedRouteId, $travelDate, 'scheduled', 'active']
+            $tripOptions = cache()->remember(
+                $tripCacheKey,
+                $this->sessionTtlSeconds(),
+                function () use ($selectedRouteId, $travelDate) {
+                    $trips = DB::select(
+                        'SELECT *
+                         FROM (
+                            SELECT t.id,
+                                   t.departure_datetime,
+                                   t.status,
+                                   GREATEST(
+                                       COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
+                                       0
+                                   ) AS available_seats
+                            FROM public.trips t
+                            LEFT JOIN public.buses b ON b.id = t.bus_id
+                            LEFT JOIN LATERAL (
+                                SELECT COUNT(*)::int AS assigned_seats
+                                FROM public.seat_assignments s
+                                WHERE s.trip_id = t.id
+                            ) sa ON true
+                            WHERE t.route_id = ?
+                              AND DATE(t.departure_datetime) = ?
+                              AND t.status IN (?, ?)
+                         ) trip_rows
+                         WHERE trip_rows.available_seats > 0
+                         ORDER BY trip_rows.departure_datetime
+                         LIMIT 20',
+                        [$selectedRouteId, $travelDate, 'scheduled', 'active']
+                    );
+
+                    return $this->normalizeTripOptions($trips);
+                }
             );
         } catch (\Exception $e) {
-            Log::error('USSD Trip Fetch Error: '.$e->getMessage());
+            $tripOptions = $this->normalizeTripOptions(cache()->get($tripCacheKey, []));
 
-            return 'END Sorry, trips are temporarily unavailable. Please try again later.';
+            if (! empty($tripOptions)) {
+                Log::warning('USSD Trip Fetch Error, serving cached trips', [
+                    'error' => $e->getMessage(),
+                    'route_id' => $selectedRouteId,
+                    'travel_date' => $travelDate,
+                ]);
+            } else {
+                Log::error('USSD Trip Fetch Error: '.$e->getMessage());
+
+                return 'END Sorry, trips are temporarily unavailable. Please try again later.';
+            }
         }
 
-        $tripOptions = $this->normalizeTripOptions($trips);
+        $tripOptions = $this->normalizeTripOptions($tripOptions);
 
         if (empty($tripOptions)) {
             cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
@@ -646,163 +705,8 @@ class UssdService
     }
 
     /**
-     * Get the most recent USSD input token from the full request payload.
-     *
-     * USSD gateways typically send the entire path entered so far, so the last token
-     * represents the current response for step-based flows.
-     *
-     * @param  array<int, string>  $userInput  Parsed USSD input tokens.
-     * @return string Latest non-empty token, or an empty string if none exists.
-     */
-    private function currentInputValue(array $userInput): string
-    {
-        $currentValue = '';
-
-        foreach (array_reverse($userInput) as $value) {
-            if ($value !== '') {
-                $currentValue = $value;
-                break;
-            }
-        }
-
-        return $currentValue;
-    }
-
-    /**
-     * Persist a trip booking and return DB-generated ticket details.
-     *
-     * @param  string  $sessionId  USSD session identifier.
-     * @param  string  $phone  Caller MSISDN to attach to passenger rows.
-     * @return array{ticket_number: string, seat_label: string, tenant_id: string, route_code: string, travel_date: string, passenger_name: string, phone: string}|null
-     */
-    private function createTripBooking(string $sessionId, string $phone): ?array
-    {
-        $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
-        $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
-        $passengerCount = 1;
-        $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
-
-        if ($selectedRouteId === null || $selectedTripId === null || $passengerCount < 1) {
-            Log::error('USSD Booking Persist Error: missing route, trip, or passenger count', [
-                'session_id' => $sessionId,
-                'selected_route_id' => $selectedRouteId,
-                'selected_trip_id' => $selectedTripId,
-                'passenger_count' => $passengerCount,
-            ]);
-
-            return null;
-        }
-
-        $selectedRoute = null;
-
-        foreach ($routeOptions as $routeOption) {
-            if ((string) ($routeOption['id'] ?? '') === (string) $selectedRouteId) {
-                $selectedRoute = $routeOption;
-                break;
-            }
-        }
-
-        if ($selectedRoute === null || empty($selectedRoute['tenant_id'])) {
-            Log::error('USSD Booking Persist Error: selected route not found in cache', [
-                'session_id' => $sessionId,
-                'selected_route_id' => $selectedRouteId,
-            ]);
-
-            return null;
-        }
-
-        try {
-            return DB::transaction(function () use ($sessionId, $selectedRoute, $selectedRouteId, $selectedTripId, $passengerCount, $phone) {
-                $baseFare = (float) ($selectedRoute['base_fare'] ?? 0);
-                $totalFare = $baseFare * $passengerCount;
-                $passengerName = $this->resolvePassengerFullName($sessionId, $phone);
-
-                $bookingResult = DB::selectOne(
-                    'WITH lock_trip AS (
-                        SELECT pg_advisory_xact_lock(?::bigint)
-                    ),
-                    new_booking AS (
-                        INSERT INTO public.bookings (tenant_id, trip_id, route_id, booking_type, total_passengers, total_fare, status, is_open_ticket)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        RETURNING id
-                    ),
-                    new_passenger AS (
-                        INSERT INTO public.booking_passengers (booking_id, name, contact_phone)
-                        SELECT nb.id, ?, ?
-                        FROM new_booking nb
-                        RETURNING id, ticket_number
-                    ),
-                    available_seat AS (
-                        SELECT s.seat_label
-                        FROM (
-                            SELECT jsonb_array_elements_text(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)) AS seat_label
-                            FROM public.trips t
-                            JOIN public.buses b ON b.id = t.bus_id
-                            WHERE t.id = ?
-                        ) s
-                        WHERE NOT EXISTS (
-                            SELECT 1
-                            FROM public.seat_assignments sa
-                            WHERE sa.trip_id = ?
-                              AND sa.seat_label = s.seat_label
-                        )
-                        ORDER BY s.seat_label
-                        LIMIT 1
-                    ),
-                    new_assignment AS (
-                        INSERT INTO public.seat_assignments (trip_id, booking_passenger_id, seat_label)
-                        SELECT ?, np.id, a.seat_label
-                        FROM new_passenger np
-                        JOIN available_seat a ON true
-                        RETURNING seat_label
-                    )
-                    SELECT np.ticket_number, na.seat_label
-                    FROM new_passenger np
-                    JOIN new_assignment na ON true
-                    LIMIT 1',
-                    [
-                        $selectedTripId,
-                        $selectedRoute['tenant_id'],
-                        $selectedTripId,
-                        $selectedRouteId,
-                        'ussd',
-                        $passengerCount,
-                        $totalFare,
-                        'confirmed',
-                        false,
-                        $passengerName,
-                        $phone,
-                        $selectedTripId,
-                        $selectedTripId,
-                        $selectedTripId,
-                    ]
-                );
-
-                if ($bookingResult === null || empty($bookingResult->seat_label)) {
-                    throw new \RuntimeException('No available seats left for this trip.');
-                }
-
-                return [
-                    'ticket_number' => (string) ($bookingResult->ticket_number ?? 'PENDING'),
-                    'seat_label' => (string) $bookingResult->seat_label,
-                    'tenant_id' => (string) $selectedRoute['tenant_id'],
-                    'route_code' => (string) ($selectedRoute['route_code'] ?? 'Unknown Route'),
-                    'travel_date' => (string) cache()->get("ussd_{$sessionId}_travel_date", ''),
-                    'passenger_name' => (string) $passengerName,
-                    'phone' => $phone,
-                ];
-            });
-        } catch (\Exception $e) {
-            Log::error('USSD Booking Persist Error: '.$e->getMessage(), [
-                'session_id' => $sessionId,
-            ]);
-
-            return null;
-        }
-    }
-
-    /**
      * Resolve a passenger full name for booking passenger rows.
+     * Checks cache first (for new registrations) then existing profiles.
      *
      * @param  string  $sessionId  USSD session identifier.
      * @param  string  $phone  Caller MSISDN.
@@ -826,95 +730,23 @@ class UssdService
     }
 
     /**
-     * Store booking details in notifications for later SMS delivery.
+     * Get the most recent USSD input token from the full request payload.
      *
-     * @param  string  $sessionId  USSD session identifier.
-     * @param  string|null  $phone  Caller phone number.
-     * @param  array{ticket_number: string, seat_label: string, tenant_id: string, route_code: string, travel_date: string, passenger_name: string, phone: string}  $bookingResult  Booking details.
+     * @param  array<int, string>  $userInput  Parsed USSD input tokens.
+     * @return string Latest non-empty token, or an empty string if none exists.
      */
-    private function recordBookingNotification(string $sessionId, ?string $phone, array $bookingResult): void
+    private function currentInputValue(array $userInput): string
     {
-        $profileId = $this->resolveNotificationProfileId($sessionId, $phone, $bookingResult['passenger_name'], $bookingResult['tenant_id']);
+        $currentValue = '';
 
-        if ($profileId === null) {
-            Log::error('USSD Notification Insert Error: no profile id available', [
-                'session_id' => $sessionId,
-                'phone' => $phone,
-            ]);
-
-            return;
-        }
-
-        try {
-            DB::insert(
-                'INSERT INTO public.notifications (profile_id, title, message, category, metadata, tenant_id)
-                 VALUES (?, ?, ?, ?, ?, ?)',
-                [
-                    $profileId,
-                    'Booking Confirmed',
-                    'Booking confirmed for '.$bookingResult['passenger_name'].' on '.$bookingResult['travel_date'].'. Ticket: '.$bookingResult['ticket_number'].'. Seat: '.$bookingResult['seat_label'].'. Route: '.$bookingResult['route_code'].'.',
-                    'booking',
-                    json_encode([
-                        'session_id' => $sessionId,
-                        'phone' => $phone,
-                        'ticket_number' => $bookingResult['ticket_number'],
-                        'seat_label' => $bookingResult['seat_label'],
-                        'route_code' => $bookingResult['route_code'],
-                        'travel_date' => $bookingResult['travel_date'],
-                    ], JSON_THROW_ON_ERROR),
-                    $bookingResult['tenant_id'],
-                ]
-            );
-        } catch (\Exception $e) {
-            Log::error('USSD Notification Insert Error: '.$e->getMessage(), [
-                'session_id' => $sessionId,
-            ]);
-        }
-    }
-
-    /**
-     * Resolve a profile id for notification rows, creating a profile if needed.
-     *
-     * @param  string  $sessionId  USSD session identifier.
-     * @param  string|null  $phone  Caller phone number.
-     * @param  string  $fullName  Passenger full name.
-     * @param  string  $tenantId  Tenant id associated with the booking.
-     * @return string|null Profile UUID or null if it could not be resolved.
-     */
-    private function resolveNotificationProfileId(string $sessionId, ?string $phone, string $fullName, string $tenantId): ?string
-    {
-        if (empty($phone)) {
-            return null;
-        }
-
-        try {
-            $profile = DB::selectOne(
-                'SELECT id FROM public.profiles WHERE phone = ? AND (tenant_id = ? OR tenant_id IS NULL) ORDER BY created_at DESC LIMIT 1',
-                [$phone, $tenantId]
-            );
-
-            if ($profile !== null && ! empty($profile->id)) {
-                return (string) $profile->id;
+        foreach (array_reverse($userInput) as $value) {
+            if ($value !== '') {
+                $currentValue = $value;
+                break;
             }
-
-            $profileId = DB::selectOne('SELECT public.get_or_create_profile(?, ?, ?, ?) AS id', [
-                $fullName,
-                $phone,
-                null,
-                $tenantId,
-            ]);
-
-            return $profileId !== null && ! empty($profileId->id)
-                ? (string) $profileId->id
-                : null;
-        } catch (\Exception $e) {
-            Log::error('USSD Notification Profile Resolve Error: '.$e->getMessage(), [
-                'session_id' => $sessionId,
-                'phone' => $phone,
-            ]);
-
-            return null;
         }
+
+        return $currentValue;
     }
 
     /**
