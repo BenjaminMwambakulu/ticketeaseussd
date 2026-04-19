@@ -38,8 +38,6 @@ class UssdService
             $response = "CON Welcome to TicketEase!\n\n";
             $response .= "1. Book Ticket\n";
             $response .= "2. My Bookings\n";
-            $response .= "3. Check Ticket\n";
-            $response .= "4. Cancel Ticket\n";
             $response .= "5. Register Account\n";
             $response .= '6. Exit';
 
@@ -73,7 +71,7 @@ class UssdService
                 return 'END Thank you for using TicketEase. Safe travels!';
             }
 
-            return "CON Invalid option. Please try again.\n\n1. Book Ticket\n5. Register Account\n6. Exit";
+            return "CON Invalid option. Please try again.\n\n1. Book Ticket\n2. My Bookings\n5. Register Account\n6. Exit";
         }
 
         return $this->continueFlow($sessionId, $phoneNumber, $userInput, $state);
@@ -200,7 +198,7 @@ class UssdService
             if ($selectedIndex === $backIndex) {
                 cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
 
-                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Check Ticket\n4. Cancel Ticket\n5. Register Account\n6. Exit";
+                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n5. Register Account\n6. Exit";
             }
 
             if ($selectedIndex < 1 || $selectedIndex > count($routeOptions)) {
@@ -296,9 +294,11 @@ class UssdService
                     'ticket_number' => $bookingResult['ticket_number'],
                 ]);
 
+                $this->recordBookingNotification($sessionId, $phone, $bookingResult);
+
                 $this->clearBookingSessionData($sessionId);
 
-                return "END Booking confirmed!\nSeat: {$bookingResult['seat_label']}\nTicket: {$bookingResult['ticket_number']}";
+                return "END Booking confirmed!\nSeat: {$bookingResult['seat_label']}\nTicket: {$bookingResult['ticket_number']}\nNotification queued for SMS delivery.";
             }
 
             if ($confirmationChoice === '2') {
@@ -326,7 +326,7 @@ class UssdService
                 cache()->forget("ussd_{$sessionId}_my_bookings_page");
                 cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
 
-                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Check Ticket\n4. Cancel Ticket\n5. Register Account\n6. Exit";
+                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n5. Register Account\n6. Exit";
             }
 
             return 'CON Invalid option.\n1. More\n2. Main Menu';
@@ -402,8 +402,7 @@ class UssdService
             $seatLabel = (string) ($booking->seat_label ?? 'Unassigned');
             $status = strtoupper((string) ($booking->status ?? 'unknown'));
 
-            $rowNumber = $offset + $index + 1;
-            $response .= $rowNumber.'. '.$ticketNumber.' | '.$routeCode."\n";
+            $response .= '- '.$ticketNumber.' | '.$routeCode."\n";
             $response .= '   '.$travelDate.' | Seat: '.$seatLabel.' | '.$status."\n";
         }
 
@@ -674,7 +673,7 @@ class UssdService
      *
      * @param  string  $sessionId  USSD session identifier.
      * @param  string  $phone  Caller MSISDN to attach to passenger rows.
-     * @return array{ticket_number: string, seat_label: string}|null
+     * @return array{ticket_number: string, seat_label: string, tenant_id: string, route_code: string, travel_date: string, passenger_name: string, phone: string}|null
      */
     private function createTripBooking(string $sessionId, string $phone): ?array
     {
@@ -786,6 +785,11 @@ class UssdService
                 return [
                     'ticket_number' => (string) ($bookingResult->ticket_number ?? 'PENDING'),
                     'seat_label' => (string) $bookingResult->seat_label,
+                    'tenant_id' => (string) $selectedRoute['tenant_id'],
+                    'route_code' => (string) ($selectedRoute['route_code'] ?? 'Unknown Route'),
+                    'travel_date' => (string) cache()->get("ussd_{$sessionId}_travel_date", ''),
+                    'passenger_name' => (string) $passengerName,
+                    'phone' => $phone,
                 ];
             });
         } catch (\Exception $e) {
@@ -819,6 +823,98 @@ class UssdService
         }
 
         return 'Passenger';
+    }
+
+    /**
+     * Store booking details in notifications for later SMS delivery.
+     *
+     * @param  string  $sessionId  USSD session identifier.
+     * @param  string|null  $phone  Caller phone number.
+     * @param  array{ticket_number: string, seat_label: string, tenant_id: string, route_code: string, travel_date: string, passenger_name: string, phone: string}  $bookingResult  Booking details.
+     */
+    private function recordBookingNotification(string $sessionId, ?string $phone, array $bookingResult): void
+    {
+        $profileId = $this->resolveNotificationProfileId($sessionId, $phone, $bookingResult['passenger_name'], $bookingResult['tenant_id']);
+
+        if ($profileId === null) {
+            Log::error('USSD Notification Insert Error: no profile id available', [
+                'session_id' => $sessionId,
+                'phone' => $phone,
+            ]);
+
+            return;
+        }
+
+        try {
+            DB::insert(
+                'INSERT INTO public.notifications (profile_id, title, message, category, metadata, tenant_id)
+                 VALUES (?, ?, ?, ?, ?, ?)',
+                [
+                    $profileId,
+                    'Booking Confirmed',
+                    'Booking confirmed for '.$bookingResult['passenger_name'].' on '.$bookingResult['travel_date'].'. Ticket: '.$bookingResult['ticket_number'].'. Seat: '.$bookingResult['seat_label'].'. Route: '.$bookingResult['route_code'].'.',
+                    'booking',
+                    json_encode([
+                        'session_id' => $sessionId,
+                        'phone' => $phone,
+                        'ticket_number' => $bookingResult['ticket_number'],
+                        'seat_label' => $bookingResult['seat_label'],
+                        'route_code' => $bookingResult['route_code'],
+                        'travel_date' => $bookingResult['travel_date'],
+                    ], JSON_THROW_ON_ERROR),
+                    $bookingResult['tenant_id'],
+                ]
+            );
+        } catch (\Exception $e) {
+            Log::error('USSD Notification Insert Error: '.$e->getMessage(), [
+                'session_id' => $sessionId,
+            ]);
+        }
+    }
+
+    /**
+     * Resolve a profile id for notification rows, creating a profile if needed.
+     *
+     * @param  string  $sessionId  USSD session identifier.
+     * @param  string|null  $phone  Caller phone number.
+     * @param  string  $fullName  Passenger full name.
+     * @param  string  $tenantId  Tenant id associated with the booking.
+     * @return string|null Profile UUID or null if it could not be resolved.
+     */
+    private function resolveNotificationProfileId(string $sessionId, ?string $phone, string $fullName, string $tenantId): ?string
+    {
+        if (empty($phone)) {
+            return null;
+        }
+
+        try {
+            $profile = DB::selectOne(
+                'SELECT id FROM public.profiles WHERE phone = ? AND (tenant_id = ? OR tenant_id IS NULL) ORDER BY created_at DESC LIMIT 1',
+                [$phone, $tenantId]
+            );
+
+            if ($profile !== null && ! empty($profile->id)) {
+                return (string) $profile->id;
+            }
+
+            $profileId = DB::selectOne('SELECT public.get_or_create_profile(?, ?, ?, ?) AS id', [
+                $fullName,
+                $phone,
+                null,
+                $tenantId,
+            ]);
+
+            return $profileId !== null && ! empty($profileId->id)
+                ? (string) $profileId->id
+                : null;
+        } catch (\Exception $e) {
+            Log::error('USSD Notification Profile Resolve Error: '.$e->getMessage(), [
+                'session_id' => $sessionId,
+                'phone' => $phone,
+            ]);
+
+            return null;
+        }
     }
 
     /**
