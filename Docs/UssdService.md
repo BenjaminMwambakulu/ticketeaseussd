@@ -9,9 +9,10 @@ The service currently supports these user paths:
 - Main menu display
 - Booking entry point
 - Dynamic route selection from `public.routes`
-- Passenger count capture
-- Travel date capture and validation
+- Single-passenger booking flow
+- Travel date capture and validation (`DD-MM-YYYY` input)
 - Trip selection from `public.trips`
+- Trip options with available seats
 - Booking confirmation or cancellation
 - Registration flow with Supabase/Postgres via `get_or_create_profile`
 - Placeholder handling for other non-implemented states
@@ -106,14 +107,14 @@ Current behavior:
 - Validates the selected route index
 - Supports the back option
 - Stores the selected route ID in cache
-- Moves the state to `booking_passengers` and prompts for passenger count
-- Validates passenger count (allowed range: 1-10)
-- Moves to `booking_travel_date` and asks for date in `YYYY-MM-DD`
+- Sets passenger count to `1` automatically
+- Moves to `booking_travel_date` and asks for date in `DD-MM-YYYY`
 - Validates date format and blocks past dates
 - Loads available trips for selected route/date and moves to `booking_trip`
 - Validates trip selection and supports changing the date
 - Moves to `booking_confirm` and shows booking summary (including selected trip)
 - On confirm, persists booking records in DB using selected `trip_id`
+- Automatically assigns the first available seat label for the selected trip
 - On cancel, clears booking cache and ends the session
 
 Cached keys used:
@@ -129,11 +130,10 @@ Cached keys used:
 Returns:
 
 - `CON Selected: ...`
-- `CON Enter number of passengers (1-10):`
-- `CON Enter travel date (YYYY-MM-DD):`
+- `CON Single passenger booking only. Enter travel date (DD-MM-YYYY):`
 - `CON Select trip:`
 - `CON Confirm Booking ...`
-- `END Booking confirmed!` including DB booking reference and `ticket_token`
+- `END Booking confirmed!` including assigned seat label and ticket number
 - `END Booking cancelled ...`
 - `CON Feature coming soon...` for unimplemented states
 
@@ -146,6 +146,7 @@ Query behavior:
 - Filters by `route_id`
 - Filters by date portion of `departure_datetime`
 - Allows `scheduled` and `active` trips
+- Only returns trips with at least one available seat
 - Orders by `departure_datetime`
 
 State updates:
@@ -162,6 +163,7 @@ Output includes:
 - `id`
 - `departure_datetime`
 - `status`
+- `available_seats`
 - `display_label`
 
 ### `tripDisplayLabel(string $departureDatetime, string $status): string`
@@ -170,7 +172,7 @@ Formats one trip entry label for USSD list display.
 
 Example:
 
-- `07:30 (SCHEDULED)`
+- `07:30 (SCHEDULED) - Seats: 18`
 
 ### `selectedTripLabel(string $sessionId): string`
 
@@ -192,9 +194,11 @@ What it writes:
     - `status = 'confirmed'`
     - `is_open_ticket = false`
 - `public.booking_passengers` rows (one per passenger)
+- `public.seat_assignments` row with an automatically chosen available seat label
 
 Returned values:
 
+- `seat_label` (auto-assigned seat)
 - `ticket_number` (trigger-generated)
 
 Notes:
@@ -274,6 +278,6 @@ Output shape:
 ## Notes
 
 - Route data comes from `public.routes`
-- Booking continuation now captures passengers, date, and required trip selection before confirm/cancel
+- Booking continuation now uses one passenger, captures date in DD-MM-YYYY, then requires trip selection before confirm/cancel
 - The route selection path is now dynamic, not hardcoded
 - The code currently logs available routes for debugging

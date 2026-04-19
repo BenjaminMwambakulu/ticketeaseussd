@@ -13,6 +13,11 @@ use Illuminate\Support\Facades\Log;
 class UssdService
 {
     /**
+     * Default cache TTL for USSD session keys in seconds.
+     */
+    private const DEFAULT_SESSION_TTL_SECONDS = 1200;
+
+    /**
      * Handle an incoming USSD request and return a USSD-compliant response string.
      *
      * @param  Request  $request  Incoming HTTP request from the USSD gateway.
@@ -38,8 +43,8 @@ class UssdService
             $response .= "5. Register Account\n";
             $response .= '6. Exit';
 
-            cache()->put("ussd_{$sessionId}_state", 'menu', 300);
-            cache()->put("ussd_{$sessionId}_phone", $phoneNumber, 300);
+            cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
+            cache()->put("ussd_{$sessionId}_phone", $phoneNumber, $this->sessionTtlSeconds());
 
             return $response;
         }
@@ -49,6 +54,13 @@ class UssdService
 
             if ($choice == '1') {
                 return $this->startBooking($sessionId, $phoneNumber);
+            }
+
+            if ($choice == '2') {
+                cache()->put("ussd_{$sessionId}_state", 'my_bookings', $this->sessionTtlSeconds());
+                cache()->put("ussd_{$sessionId}_my_bookings_page", 1, $this->sessionTtlSeconds());
+
+                return $this->showMyBookingsPage($sessionId, $phoneNumber, 1);
             }
 
             if ($choice == '5') {
@@ -80,15 +92,15 @@ class UssdService
         $step = cache()->get("ussd_{$sessionId}_reg_step", 1);
 
         if ($step == 1) {
-            cache()->put("ussd_{$sessionId}_reg_step", 2, 300);
+            cache()->put("ussd_{$sessionId}_reg_step", 2, $this->sessionTtlSeconds());
 
             return 'CON Enter your Full Name:';
         }
 
         if ($step == 2) {
             $fullName = $this->currentInputValue($userInput);
-            cache()->put("ussd_{$sessionId}_full_name", $fullName, 300);
-            cache()->put("ussd_{$sessionId}_reg_step", 3, 300);
+            cache()->put("ussd_{$sessionId}_full_name", $fullName, $this->sessionTtlSeconds());
+            cache()->put("ussd_{$sessionId}_reg_step", 3, $this->sessionTtlSeconds());
 
             return 'CON Enter your National ID:';
         }
@@ -132,8 +144,8 @@ class UssdService
      */
     private function startBooking($sessionId, $phone): string
     {
-        cache()->put("ussd_{$sessionId}_state", 'booking_route', 300);
-        cache()->put("ussd_{$sessionId}_phone", $phone, 300);
+        cache()->put("ussd_{$sessionId}_state", 'booking_route', $this->sessionTtlSeconds());
+        cache()->put("ussd_{$sessionId}_phone", $phone, $this->sessionTtlSeconds());
 
         try {
             $routes = DB::select('SELECT r.id, r.tenant_id, r.route_code, r.base_fare, t.name as tenant_name FROM public.routes r LEFT JOIN public.tenants t ON t.id = r.tenant_id ORDER BY r.id');
@@ -149,7 +161,7 @@ class UssdService
 
         $routeOptions = $this->normalizeRouteOptions($routes);
 
-        cache()->put("ussd_{$sessionId}_route_options", $routeOptions, 300);
+        cache()->put("ussd_{$sessionId}_route_options", $routeOptions, $this->sessionTtlSeconds());
         Log::info('Available routes', ['data' => $routeOptions]);
 
         $response = "CON Book Ticket\nSelect route:\n";
@@ -186,7 +198,7 @@ class UssdService
             $backIndex = count($routeOptions) + 1;
 
             if ($selectedIndex === $backIndex) {
-                cache()->put("ussd_{$sessionId}_state", 'menu', 300);
+                cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
 
                 return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Check Ticket\n4. Cancel Ticket\n5. Register Account\n6. Exit";
             }
@@ -197,43 +209,38 @@ class UssdService
 
             $selectedRoute = $routeOptions[$selectedIndex - 1];
 
-            cache()->put("ussd_{$sessionId}_selected_route_id", $selectedRoute['id'], 300);
-            cache()->put("ussd_{$sessionId}_state", 'booking_passengers', 300);
+            cache()->put("ussd_{$sessionId}_selected_route_id", $selectedRoute['id'], $this->sessionTtlSeconds());
+            cache()->put("ussd_{$sessionId}_passenger_count", 1, $this->sessionTtlSeconds());
+            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-            return 'CON Selected: '.$selectedRoute['display_label']."\nEnter number of passengers:";
+            return 'CON Selected: '.$selectedRoute['display_label']."\nSingle passenger booking only.\nEnter travel date (DD-MM-YYYY):";
         }
 
         if ($state === 'booking_passengers') {
-            $passengerCount = (int) $this->currentInputValue($userInput);
+            cache()->put("ussd_{$sessionId}_passenger_count", 1, $this->sessionTtlSeconds());
+            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-            if ($passengerCount < 1 || $passengerCount > 10) {
-                return 'CON Enter number of passengers (1-10):';
-            }
-
-            cache()->put("ussd_{$sessionId}_passenger_count", $passengerCount, 300);
-            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', 300);
-
-            return 'CON Enter travel date (YYYY-MM-DD):';
+            return 'CON Single passenger booking only. Enter travel date (DD-MM-YYYY):';
         }
 
         if ($state === 'booking_travel_date') {
             $travelDateInput = $this->currentInputValue($userInput);
 
-            if (! preg_match('/^\d{4}-\d{2}-\d{2}$/', $travelDateInput)) {
-                return 'CON Invalid date format. Enter as YYYY-MM-DD:';
+            if (! preg_match('/^\d{2}-\d{2}-\d{4}$/', $travelDateInput)) {
+                return 'CON Invalid date format. Enter as DD-MM-YYYY:';
             }
 
             try {
-                $travelDate = Carbon::createFromFormat('Y-m-d', $travelDateInput)->startOfDay();
+                $travelDate = Carbon::createFromFormat('d-m-Y', $travelDateInput)->startOfDay();
             } catch (\Exception $e) {
-                return 'CON Invalid date. Enter travel date as YYYY-MM-DD:';
+                return 'CON Invalid date. Enter travel date as DD-MM-YYYY:';
             }
 
             if ($travelDate->lt(Carbon::today())) {
-                return 'CON Travel date cannot be in the past. Enter YYYY-MM-DD:';
+                return 'CON Travel date cannot be in the past. Enter DD-MM-YYYY:';
             }
 
-            cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), 300);
+            cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
 
             return $this->startTripSelection($sessionId);
         }
@@ -250,9 +257,9 @@ class UssdService
             $backIndex = count($tripOptions) + 1;
 
             if ($selectedIndex === $backIndex) {
-                cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', 300);
+                cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-                return 'CON Enter travel date (YYYY-MM-DD):';
+                return 'CON Enter travel date (DD-MM-YYYY):';
             }
 
             if ($selectedIndex < 1 || $selectedIndex > count($tripOptions)) {
@@ -261,8 +268,8 @@ class UssdService
 
             $selectedTrip = $tripOptions[$selectedIndex - 1];
 
-            cache()->put("ussd_{$sessionId}_selected_trip_id", $selectedTrip['id'], 300);
-            cache()->put("ussd_{$sessionId}_state", 'booking_confirm', 300);
+            cache()->put("ussd_{$sessionId}_selected_trip_id", $selectedTrip['id'], $this->sessionTtlSeconds());
+            cache()->put("ussd_{$sessionId}_state", 'booking_confirm', $this->sessionTtlSeconds());
 
             return "CON Confirm Booking\n"
                 .$this->bookingSummary($sessionId)
@@ -285,12 +292,13 @@ class UssdService
                     'route_id' => cache()->get("ussd_{$sessionId}_selected_route_id"),
                     'passenger_count' => cache()->get("ussd_{$sessionId}_passenger_count"),
                     'travel_date' => cache()->get("ussd_{$sessionId}_travel_date"),
+                    'seat_label' => $bookingResult['seat_label'],
                     'ticket_number' => $bookingResult['ticket_number'],
                 ]);
 
                 $this->clearBookingSessionData($sessionId);
 
-                return "END Booking confirmed!\nTicket: {$bookingResult['ticket_number']}";
+                return "END Booking confirmed!\nSeat: {$bookingResult['seat_label']}\nTicket: {$bookingResult['ticket_number']}";
             }
 
             if ($confirmationChoice === '2') {
@@ -304,7 +312,108 @@ class UssdService
                 ."\n1. Confirm\n2. Cancel";
         }
 
+        if ($state === 'my_bookings') {
+            $choice = $this->currentInputValue($userInput);
+
+            if ($choice === '1') {
+                $nextPage = ((int) cache()->get("ussd_{$sessionId}_my_bookings_page", 1)) + 1;
+                cache()->put("ussd_{$sessionId}_my_bookings_page", $nextPage, $this->sessionTtlSeconds());
+
+                return $this->showMyBookingsPage($sessionId, $phone, $nextPage);
+            }
+
+            if ($choice === '2') {
+                cache()->forget("ussd_{$sessionId}_my_bookings_page");
+                cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
+
+                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Check Ticket\n4. Cancel Ticket\n5. Register Account\n6. Exit";
+            }
+
+            return 'CON Invalid option.\n1. More\n2. Main Menu';
+        }
+
         return 'CON Feature coming soon...';
+    }
+
+    /**
+     * Show recent bookings for the caller phone number.
+     *
+     * @param  string|null  $phone  Caller MSISDN supplied by the gateway.
+     * @return string Booking list response.
+     */
+    private function showMyBookingsPage(string $sessionId, ?string $phone, int $page): string
+    {
+        if (empty($phone)) {
+            return 'END Unable to identify your phone number. Please try again.';
+        }
+
+        $pageSize = 3;
+        $offset = max($page - 1, 0) * $pageSize;
+
+        try {
+            $bookings = DB::select(
+                'SELECT bp.ticket_number,
+                        b.status,
+                        r.route_code,
+                        t.departure_datetime,
+                        sa.seat_label,
+                        b.created_at
+                 FROM public.booking_passengers bp
+                 JOIN public.bookings b ON b.id = bp.booking_id
+                 LEFT JOIN public.routes r ON r.id = b.route_id
+                 LEFT JOIN public.trips t ON t.id = b.trip_id
+                 LEFT JOIN public.seat_assignments sa ON sa.booking_passenger_id = bp.id
+                 WHERE bp.contact_phone = ?
+                 ORDER BY b.created_at DESC
+                 LIMIT ? OFFSET ?',
+                [$phone, $pageSize + 1, $offset]
+            );
+        } catch (\Exception $e) {
+            Log::error('USSD My Bookings Error: '.$e->getMessage(), ['phone' => $phone]);
+
+            return 'END Sorry, we could not fetch your bookings right now. Please try again later.';
+        }
+
+        if (empty($bookings)) {
+            cache()->forget("ussd_{$sessionId}_my_bookings_page");
+            cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
+
+            return 'END No bookings found for your number yet.';
+        }
+
+        $hasMore = count($bookings) > $pageSize;
+        $visibleBookings = array_slice($bookings, 0, $pageSize);
+
+        $response = "CON My Bookings\n";
+
+        foreach ($visibleBookings as $index => $booking) {
+            $travelDate = 'N/A';
+
+            if (! empty($booking->departure_datetime)) {
+                try {
+                    $travelDate = Carbon::parse($booking->departure_datetime)->format('d-m-Y H:i');
+                } catch (\Exception $e) {
+                    $travelDate = 'N/A';
+                }
+            }
+
+            $ticketNumber = (string) ($booking->ticket_number ?? 'N/A');
+            $routeCode = (string) ($booking->route_code ?? 'Unknown Route');
+            $seatLabel = (string) ($booking->seat_label ?? 'Unassigned');
+            $status = strtoupper((string) ($booking->status ?? 'unknown'));
+
+            $rowNumber = $offset + $index + 1;
+            $response .= $rowNumber.'. '.$ticketNumber.' | '.$routeCode."\n";
+            $response .= '   '.$travelDate.' | Seat: '.$seatLabel.' | '.$status."\n";
+        }
+
+        if ($hasMore) {
+            $response .= "1. More\n2. Main Menu";
+        } else {
+            $response .= '2. Main Menu';
+        }
+
+        return rtrim($response);
     }
 
     /**
@@ -319,19 +428,29 @@ class UssdService
         $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
 
         if ($selectedRouteId === null || $travelDate === null) {
-            cache()->put("ussd_{$sessionId}_state", 'booking_route', 300);
+            cache()->put("ussd_{$sessionId}_state", 'booking_route', $this->sessionTtlSeconds());
 
             return 'CON Booking session expired. Please select route again.';
         }
 
         try {
             $trips = DB::select(
-                'SELECT id, departure_datetime, status
-                 FROM public.trips
-                 WHERE route_id = ?
-                   AND DATE(departure_datetime) = ?
-                   AND status IN (?, ?)
-                 ORDER BY departure_datetime',
+                'SELECT t.id,
+                        t.departure_datetime,
+                        t.status,
+                        GREATEST(COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0), 0) AS available_seats
+                                 FROM public.trips t
+                                 LEFT JOIN public.buses b ON b.id = t.bus_id
+                                 LEFT JOIN (
+                    SELECT trip_id, COUNT(*)::int AS assigned_seats
+                    FROM public.seat_assignments
+                    GROUP BY trip_id
+                                 ) sa ON sa.trip_id = t.id
+                                 WHERE t.route_id = ?
+                   AND DATE(t.departure_datetime) = ?
+                   AND t.status IN (?, ?)
+                   AND GREATEST(COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0), 0) > 0
+                                 ORDER BY t.departure_datetime',
                 [$selectedRouteId, $travelDate, 'scheduled', 'active']
             );
         } catch (\Exception $e) {
@@ -343,13 +462,13 @@ class UssdService
         $tripOptions = $this->normalizeTripOptions($trips);
 
         if (empty($tripOptions)) {
-            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', 300);
+            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-            return 'CON No trips found for that date. Enter another date (YYYY-MM-DD):';
+            return 'CON No trips with available seats found for that date. Enter another date (DD-MM-YYYY):';
         }
 
-        cache()->put("ussd_{$sessionId}_trip_options", $tripOptions, 300);
-        cache()->put("ussd_{$sessionId}_state", 'booking_trip', 300);
+        cache()->put("ussd_{$sessionId}_trip_options", $tripOptions, $this->sessionTtlSeconds());
+        cache()->put("ussd_{$sessionId}_state", 'booking_trip', $this->sessionTtlSeconds());
 
         $response = "CON Select trip:\n";
 
@@ -477,7 +596,7 @@ class UssdService
      * Convert trip records into plain arrays for safe cache storage.
      *
      * @param  array<int, mixed>  $trips  Raw DB rows or cached trip records.
-     * @return array<int, array{id: int|string, departure_datetime: string, status: string, display_label: string}>
+     * @return array<int, array{id: int|string, departure_datetime: string, status: string, available_seats: int, display_label: string}>
      */
     private function normalizeTripOptions(array $trips): array
     {
@@ -494,12 +613,14 @@ class UssdService
 
             $departureDatetime = (string) ($trip['departure_datetime'] ?? '');
             $status = strtoupper((string) ($trip['status'] ?? ''));
+            $availableSeats = (int) ($trip['available_seats'] ?? 0);
 
             $normalizedTrips[] = [
                 'id' => $trip['id'] ?? null,
                 'departure_datetime' => $departureDatetime,
                 'status' => (string) ($trip['status'] ?? ''),
-                'display_label' => $this->tripDisplayLabel($departureDatetime, $status),
+                'available_seats' => $availableSeats,
+                'display_label' => $this->tripDisplayLabel($departureDatetime, $status, $availableSeats),
             ];
         }
 
@@ -511,9 +632,10 @@ class UssdService
      *
      * @param  string  $departureDatetime  Departure timestamp.
      * @param  string  $status  Trip status label.
+     * @param  int  $availableSeats  Computed available seat count.
      * @return string Menu label for one trip option.
      */
-    private function tripDisplayLabel(string $departureDatetime, string $status): string
+    private function tripDisplayLabel(string $departureDatetime, string $status, int $availableSeats): string
     {
         try {
             $departure = Carbon::parse($departureDatetime)->format('H:i');
@@ -521,7 +643,7 @@ class UssdService
             $departure = 'Unknown time';
         }
 
-        return $departure.' ('.$status.')';
+        return $departure.' ('.$status.') - Seats: '.$availableSeats;
     }
 
     /**
@@ -552,13 +674,13 @@ class UssdService
      *
      * @param  string  $sessionId  USSD session identifier.
      * @param  string  $phone  Caller MSISDN to attach to passenger rows.
-     * @return array{ticket_number: string}|null
+     * @return array{ticket_number: string, seat_label: string}|null
      */
     private function createTripBooking(string $sessionId, string $phone): ?array
     {
         $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
         $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
-        $passengerCount = (int) cache()->get("ussd_{$sessionId}_passenger_count", 0);
+        $passengerCount = 1;
         $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
 
         if ($selectedRouteId === null || $selectedTripId === null || $passengerCount < 1) {
@@ -596,11 +718,51 @@ class UssdService
                 $totalFare = $baseFare * $passengerCount;
                 $passengerName = $this->resolvePassengerFullName($sessionId, $phone);
 
-                $booking = DB::selectOne(
-                    'INSERT INTO public.bookings (tenant_id, trip_id, route_id, booking_type, total_passengers, total_fare, status, is_open_ticket)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                     RETURNING id',
+                $bookingResult = DB::selectOne(
+                    'WITH lock_trip AS (
+                        SELECT pg_advisory_xact_lock(?::bigint)
+                    ),
+                    new_booking AS (
+                        INSERT INTO public.bookings (tenant_id, trip_id, route_id, booking_type, total_passengers, total_fare, status, is_open_ticket)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        RETURNING id
+                    ),
+                    new_passenger AS (
+                        INSERT INTO public.booking_passengers (booking_id, name, contact_phone)
+                        SELECT nb.id, ?, ?
+                        FROM new_booking nb
+                        RETURNING id, ticket_number
+                    ),
+                    available_seat AS (
+                        SELECT s.seat_label
+                        FROM (
+                            SELECT jsonb_array_elements_text(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)) AS seat_label
+                            FROM public.trips t
+                            JOIN public.buses b ON b.id = t.bus_id
+                            WHERE t.id = ?
+                        ) s
+                        WHERE NOT EXISTS (
+                            SELECT 1
+                            FROM public.seat_assignments sa
+                            WHERE sa.trip_id = ?
+                              AND sa.seat_label = s.seat_label
+                        )
+                        ORDER BY s.seat_label
+                        LIMIT 1
+                    ),
+                    new_assignment AS (
+                        INSERT INTO public.seat_assignments (trip_id, booking_passenger_id, seat_label)
+                        SELECT ?, np.id, a.seat_label
+                        FROM new_passenger np
+                        JOIN available_seat a ON true
+                        RETURNING seat_label
+                    )
+                    SELECT np.ticket_number, na.seat_label
+                    FROM new_passenger np
+                    JOIN new_assignment na ON true
+                    LIMIT 1',
                     [
+                        $selectedTripId,
                         $selectedRoute['tenant_id'],
                         $selectedTripId,
                         $selectedRouteId,
@@ -609,30 +771,21 @@ class UssdService
                         $totalFare,
                         'confirmed',
                         false,
+                        $passengerName,
+                        $phone,
+                        $selectedTripId,
+                        $selectedTripId,
+                        $selectedTripId,
                     ]
                 );
 
-                $firstPassenger = null;
-
-                for ($i = 1; $i <= $passengerCount; $i++) {
-                    $passenger = DB::selectOne(
-                        'INSERT INTO public.booking_passengers (booking_id, name, contact_phone)
-                         VALUES (?, ?, ?)
-                         RETURNING id, ticket_number',
-                        [
-                            $booking->id,
-                            $passengerName,
-                            $phone,
-                        ]
-                    );
-
-                    if ($firstPassenger === null) {
-                        $firstPassenger = $passenger;
-                    }
+                if ($bookingResult === null || empty($bookingResult->seat_label)) {
+                    throw new \RuntimeException('No available seats left for this trip.');
                 }
 
                 return [
-                    'ticket_number' => (string) ($firstPassenger->ticket_number ?? 'PENDING'),
+                    'ticket_number' => (string) ($bookingResult->ticket_number ?? 'PENDING'),
+                    'seat_label' => (string) $bookingResult->seat_label,
                 ];
             });
         } catch (\Exception $e) {
@@ -666,5 +819,13 @@ class UssdService
         }
 
         return 'Passenger';
+    }
+
+    /**
+     * Resolve session cache TTL with environment override.
+     */
+    private function sessionTtlSeconds(): int
+    {
+        return max((int) env('USSD_SESSION_TTL_SECONDS', self::DEFAULT_SESSION_TTL_SECONDS), 300);
     }
 }
