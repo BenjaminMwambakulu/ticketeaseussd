@@ -2,7 +2,6 @@
 
 namespace App\Services;
 
-use App\Jobs\ProcessUssdBooking;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -306,31 +305,36 @@ class UssdService
                 $passengerName = $this->resolvePassengerFullName($sessionId, (string) $phone);
                 $totalFare = (float) ($selectedRoute['base_fare'] ?? 0) * $passengerCount;
 
-                // Dispatch the heavy transaction to the background queue
-                ProcessUssdBooking::dispatch($sessionId, (string) $phone, [
-                    'route_id' => $selectedRouteId,
-                    'trip_id' => $selectedTripId,
-                    'tenant_id' => $selectedRoute['tenant_id'],
-                    'route_code' => $selectedRoute['route_code'],
-                    'travel_date' => $travelDate,
-                    'total_fare' => $totalFare,
-                    'passenger_count' => $passengerCount,
-                    'passenger_name' => $passengerName,
-                ]);
+                try {
+                    $bookingResult = $this->processBookingImmediately($sessionId, (string) $phone, [
+                        'route_id' => $selectedRouteId,
+                        'trip_id' => $selectedTripId,
+                        'tenant_id' => (string) ($selectedRoute['tenant_id'] ?? ''),
+                        'route_code' => (string) ($selectedRoute['route_code'] ?? ''),
+                        'travel_date' => (string) $travelDate,
+                        'total_fare' => $totalFare,
+                        'passenger_count' => $passengerCount,
+                        'passenger_name' => $passengerName,
+                    ]);
 
-                Log::info('USSD Booking Dispatched to Queue', [
-                    'session_id' => $sessionId,
-                    'phone' => $phone,
-                    'trip_id' => $selectedTripId,
-                ]);
+                    $this->clearBookingSessionData($sessionId);
 
-                $this->clearBookingSessionData($sessionId);
+                    return "END Thank you!\n"
+                        ."Your booking is confirmed.\n"
+                        .'Ticket: '.$bookingResult['ticket_number']."\n"
+                        .'Seat: '.$bookingResult['seat_label'];
+                } catch (\Throwable $e) {
+                    Log::error('USSD Direct Booking Failed', [
+                        'session_id' => $sessionId,
+                        'phone' => $phone,
+                        'trip_id' => $selectedTripId,
+                        'error' => $e->getMessage(),
+                    ]);
 
-                return "END Thank you!\n"
-                    ."Your booking is being processed.\n"
-                    ."Ticket: Pending\n"
-                    ."Seat: Pending\n"
-                    ."If SMS is delayed, dial again and select My Bookings.";
+                    $this->clearBookingSessionData($sessionId);
+
+                    return 'END Sorry, booking failed right now. Please try again later.';
+                }
             }
 
             if ($confirmationChoice === '2') {
@@ -727,6 +731,197 @@ class UssdService
         }
 
         return 'Passenger';
+    }
+
+    /**
+     * Process booking instantly without dispatching a queue job.
+     *
+     * @param  string  $sessionId  USSD session identifier.
+     * @param  string  $phone  Caller MSISDN.
+     * @param  array{route_id:mixed,trip_id:mixed,tenant_id:string,route_code:string,travel_date:string,total_fare:float|int|string,passenger_count:int,passenger_name:string}  $bookingData
+     * @return array{ticket_number:string,seat_label:string}
+     */
+    private function processBookingImmediately(string $sessionId, string $phone, array $bookingData): array
+    {
+        Log::info('Processing USSD Booking Directly', [
+            'session_id' => $sessionId,
+            'phone' => $phone,
+            'trip_id' => $bookingData['trip_id'] ?? 'unknown',
+        ]);
+
+        $selectedTripId = $bookingData['trip_id'];
+        $tenantId = $bookingData['tenant_id'];
+        $selectedRouteId = $bookingData['route_id'];
+        $passengerCount = (int) ($bookingData['passenger_count'] ?? 1);
+        $totalFare = (float) ($bookingData['total_fare'] ?? 0);
+        $passengerName = (string) ($bookingData['passenger_name'] ?? 'Passenger');
+
+        $bookingResult = DB::transaction(function () use (
+            $selectedTripId,
+            $tenantId,
+            $selectedRouteId,
+            $passengerCount,
+            $totalFare,
+            $passengerName,
+            $phone
+        ) {
+            $result = DB::selectOne(
+                'WITH lock_trip AS (
+                    SELECT pg_advisory_xact_lock(?::bigint)
+                ),
+                new_booking AS (
+                    INSERT INTO public.bookings (tenant_id, trip_id, route_id, booking_type, total_passengers, total_fare, status, is_open_ticket)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?::boolean)
+                    RETURNING id
+                ),
+                new_passenger AS (
+                    INSERT INTO public.booking_passengers (booking_id, name, contact_phone)
+                    SELECT nb.id, ?, ?
+                    FROM new_booking nb
+                    RETURNING id, ticket_number
+                ),
+                available_seat AS (
+                    SELECT s.seat_label
+                    FROM (
+                        SELECT jsonb_array_elements_text(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)) AS seat_label
+                        FROM public.trips t
+                        JOIN public.buses b ON b.id = t.bus_id
+                        WHERE t.id = ?
+                    ) s
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM public.seat_assignments sa
+                        WHERE sa.trip_id = ?
+                          AND sa.seat_label = s.seat_label
+                    )
+                    ORDER BY s.seat_label
+                    LIMIT 1
+                ),
+                new_assignment AS (
+                    INSERT INTO public.seat_assignments (trip_id, booking_passenger_id, seat_label)
+                    SELECT ?, np.id, a.seat_label
+                    FROM new_passenger np
+                    JOIN available_seat a ON true
+                    RETURNING seat_label
+                )
+                SELECT np.ticket_number, na.seat_label
+                FROM new_passenger np
+                JOIN new_assignment na ON true
+                LIMIT 1',
+                [
+                    $selectedTripId,
+                    $tenantId,
+                    $selectedTripId,
+                    $selectedRouteId,
+                    'ussd',
+                    $passengerCount,
+                    $totalFare,
+                    'confirmed',
+                    false,
+                    $passengerName,
+                    $phone,
+                    $selectedTripId,
+                    $selectedTripId,
+                    $selectedTripId,
+                ]
+            );
+
+            if ($result === null || empty($result->seat_label)) {
+                throw new \RuntimeException("No available seats left for trip ID: {$selectedTripId}");
+            }
+
+            return [
+                'ticket_number' => (string) ($result->ticket_number ?? 'PENDING'),
+                'seat_label' => (string) $result->seat_label,
+            ];
+        });
+
+        Log::info('USSD Direct Booking Successful', [
+            'session_id' => $sessionId,
+            'ticket' => $bookingResult['ticket_number'],
+            'seat' => $bookingResult['seat_label'],
+        ]);
+
+        $this->recordBookingNotification(
+            $phone,
+            $bookingData['tenant_id'],
+            $bookingData['route_code'],
+            $bookingData['travel_date'],
+            $bookingData['passenger_name'],
+            $bookingResult
+        );
+
+        return $bookingResult;
+    }
+
+    /**
+     * Persist booking confirmation notification payload.
+     *
+     * @param  array{ticket_number:string,seat_label:string}  $bookingResult
+     */
+    private function recordBookingNotification(
+        string $phone,
+        string $tenantId,
+        string $routeCode,
+        string $travelDate,
+        string $passengerName,
+        array $bookingResult
+    ): void {
+        $profileId = $this->resolveNotificationProfileId($phone, $passengerName, $tenantId);
+
+        $message = "TicketEase: Booking confirmed for {$passengerName} on {$travelDate}. Ticket: {$bookingResult['ticket_number']}. Seat: {$bookingResult['seat_label']}. Route: {$routeCode}. Safe travels!";
+
+        try {
+            DB::insert(
+                'INSERT INTO public.notifications (profile_id, title, message, category, metadata, tenant_id)
+                 VALUES (?, ?, ?, ?, ?, ?)',
+                [
+                    $profileId,
+                    'Booking Confirmed',
+                    $message,
+                    'booking',
+                    json_encode([
+                        'ticket_number' => $bookingResult['ticket_number'],
+                        'seat_label' => $bookingResult['seat_label'],
+                        'route_code' => $routeCode,
+                        'travel_date' => $travelDate,
+                    ]),
+                    $tenantId,
+                ]
+            );
+
+            Log::info('USSD Direct Booking SMS Notification Recorded', ['phone' => $phone, 'message' => $message]);
+        } catch (\Throwable $e) {
+            Log::error('Failed to record/send direct USSD SMS', ['error' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Resolve or create profile id for notifications.
+     */
+    private function resolveNotificationProfileId(string $phone, string $fullName, string $tenantId): ?string
+    {
+        try {
+            $profile = DB::selectOne(
+                'SELECT id FROM public.profiles WHERE phone = ? AND (tenant_id = ? OR tenant_id IS NULL) ORDER BY created_at DESC LIMIT 1',
+                [$phone, $tenantId]
+            );
+
+            if ($profile !== null && ! empty($profile->id)) {
+                return (string) $profile->id;
+            }
+
+            $result = DB::selectOne('SELECT public.get_or_create_profile(?, ?, ?, ?) AS id', [
+                $fullName,
+                $phone,
+                null,
+                $tenantId,
+            ]);
+
+            return $result !== null && ! empty($result->id) ? (string) $result->id : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     /**
