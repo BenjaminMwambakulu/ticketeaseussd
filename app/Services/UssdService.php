@@ -5,7 +5,9 @@ namespace App\Services;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 
 /**
  * Coordinates USSD menu flow, session state transitions, and DB-backed actions.
@@ -105,12 +107,33 @@ class UssdService
 
         if ($step == 3) {
             $nationalId = $this->currentInputValue($userInput);
+            cache()->put("ussd_{$sessionId}_national_id", $nationalId, $this->sessionTtlSeconds());
+            cache()->put("ussd_{$sessionId}_reg_step", 4, $this->sessionTtlSeconds());
+
+            return 'CON Set a 4-digit payment PIN:';
+        }
+
+        if ($step == 4) {
+            $pin = $this->currentInputValue($userInput);
+
+            if (! preg_match('/^\d{4}$/', $pin)) {
+                return 'CON Invalid PIN. Enter a 4-digit payment PIN:';
+            }
+
             $fullName = cache()->get("ussd_{$sessionId}_full_name");
+            $nationalId = cache()->get("ussd_{$sessionId}_national_id");
 
             try {
-                DB::select('SELECT public.get_or_create_profile(?, ?, ?, NULL) as id', [
+                $profileResult = DB::selectOne('SELECT public.get_or_create_profile(?, ?, ?, NULL) as id', [
                     $fullName, $phone, $nationalId,
                 ]);
+
+                if ($profileResult !== null && ! empty($profileResult->id)) {
+                    DB::update('UPDATE public.profiles SET payment_pin_hash = ?, updated_at = NOW() WHERE id = ?', [
+                        Hash::make($pin),
+                        (string) $profileResult->id,
+                    ]);
+                }
 
                 Log::info('USSD Registration Successful', [
                     'session_id' => $sessionId,
@@ -121,6 +144,7 @@ class UssdService
 
                 cache()->forget("ussd_{$sessionId}_reg_step");
                 cache()->forget("ussd_{$sessionId}_full_name");
+                cache()->forget("ussd_{$sessionId}_national_id");
 
                 return "END Registration successful!\nYour account is now active.\nDial again to book tickets.";
             } catch (\Exception $e) {
@@ -284,57 +308,9 @@ class UssdService
             $confirmationChoice = $this->currentInputValue($userInput);
 
             if ($confirmationChoice === '1') {
-                $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
-                $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
-                $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
-                $passengerCount = (int) cache()->get("ussd_{$sessionId}_passenger_count", 1);
+                cache()->put("ussd_{$sessionId}_state", 'booking_payment_pin', $this->sessionTtlSeconds());
 
-                $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
-                $selectedRoute = null;
-                foreach ($routeOptions as $route) {
-                    if ((string) ($route['id'] ?? '') === (string) $selectedRouteId) {
-                        $selectedRoute = $route;
-                        break;
-                    }
-                }
-
-                if (! $selectedRoute || ! $selectedTripId) {
-                    return 'END Your booking session has expired. Please dial again to start over.';
-                }
-
-                $passengerName = $this->resolvePassengerFullName($sessionId, (string) $phone);
-                $totalFare = (float) ($selectedRoute['base_fare'] ?? 0) * $passengerCount;
-
-                try {
-                    $bookingResult = $this->processBookingImmediately($sessionId, (string) $phone, [
-                        'route_id' => $selectedRouteId,
-                        'trip_id' => $selectedTripId,
-                        'tenant_id' => (string) ($selectedRoute['tenant_id'] ?? ''),
-                        'route_code' => (string) ($selectedRoute['route_code'] ?? ''),
-                        'travel_date' => (string) $travelDate,
-                        'total_fare' => $totalFare,
-                        'passenger_count' => $passengerCount,
-                        'passenger_name' => $passengerName,
-                    ]);
-
-                    $this->clearBookingSessionData($sessionId);
-
-                    return "END Thank you!\n"
-                        ."Your booking is confirmed.\n"
-                        .'Ticket: '.$bookingResult['ticket_number']."\n"
-                        .'Seat: '.$bookingResult['seat_label'];
-                } catch (\Throwable $e) {
-                    Log::error('USSD Direct Booking Failed', [
-                        'session_id' => $sessionId,
-                        'phone' => $phone,
-                        'trip_id' => $selectedTripId,
-                        'error' => $e->getMessage(),
-                    ]);
-
-                    $this->clearBookingSessionData($sessionId);
-
-                    return 'END Sorry, booking failed right now. Please try again later.';
-                }
+                return 'CON Enter your 4-digit payment PIN to confirm payment:';
             }
 
             if ($confirmationChoice === '2') {
@@ -346,6 +322,79 @@ class UssdService
             return "CON Invalid option.\n"
                 .$this->bookingSummary($sessionId)
                 ."\n1. Confirm\n2. Cancel";
+        }
+
+        if ($state === 'booking_payment_pin') {
+            $enteredPin = $this->currentInputValue($userInput);
+
+            if (! preg_match('/^\d{4}$/', $enteredPin)) {
+                return 'CON Invalid PIN format. Enter your 4-digit payment PIN:';
+            }
+
+            $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
+            $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
+            $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
+            $passengerCount = (int) cache()->get("ussd_{$sessionId}_passenger_count", 1);
+
+            $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
+            $selectedRoute = null;
+            foreach ($routeOptions as $route) {
+                if ((string) ($route['id'] ?? '') === (string) $selectedRouteId) {
+                    $selectedRoute = $route;
+                    break;
+                }
+            }
+
+            if (! $selectedRoute || ! $selectedTripId) {
+                return 'END Your booking session has expired. Please dial again to start over.';
+            }
+
+            $tenantId = (string) ($selectedRoute['tenant_id'] ?? '');
+            $pinVerification = $this->verifyPaymentPin((string) $phone, $tenantId, $enteredPin);
+
+            if ($pinVerification === null) {
+                $this->clearBookingSessionData($sessionId);
+
+                return 'END No payment PIN found for your account. Please register first to set your PIN.';
+            }
+
+            if (! $pinVerification) {
+                return 'CON Incorrect PIN. Please enter your 4-digit payment PIN:';
+            }
+
+            $passengerName = $this->resolvePassengerFullName($sessionId, (string) $phone);
+            $totalFare = (float) ($selectedRoute['base_fare'] ?? 0) * $passengerCount;
+
+            try {
+                $bookingResult = $this->processBookingImmediately($sessionId, (string) $phone, [
+                    'route_id' => $selectedRouteId,
+                    'trip_id' => $selectedTripId,
+                    'tenant_id' => $tenantId,
+                    'route_code' => (string) ($selectedRoute['route_code'] ?? ''),
+                    'travel_date' => (string) $travelDate,
+                    'total_fare' => $totalFare,
+                    'passenger_count' => $passengerCount,
+                    'passenger_name' => $passengerName,
+                ]);
+
+                $this->clearBookingSessionData($sessionId);
+
+                return "END Thank you!\n"
+                    ."Your booking is confirmed.\n"
+                    .'Ticket: '.$bookingResult['ticket_number']."\n"
+                    .'Seat: '.$bookingResult['seat_label'];
+            } catch (\Throwable $e) {
+                Log::error('USSD Direct Booking Failed', [
+                    'session_id' => $sessionId,
+                    'phone' => $phone,
+                    'trip_id' => $selectedTripId,
+                    'error' => $e->getMessage(),
+                ]);
+
+                $this->clearBookingSessionData($sessionId);
+
+                return 'END Sorry, booking failed right now. Please try again later.';
+            }
         }
 
         if ($state === 'my_bookings') {
@@ -765,6 +814,8 @@ class UssdService
             $passengerName,
             $phone
         ) {
+            $transactionReference = 'USSD-'.strtoupper(substr(str_replace('-', '', (string) Str::uuid()), 0, 12));
+
             $result = DB::selectOne(
                 'WITH lock_trip AS (
                     SELECT pg_advisory_xact_lock(?::bigint)
@@ -779,6 +830,12 @@ class UssdService
                     SELECT nb.id, ?, ?
                     FROM new_booking nb
                     RETURNING id, ticket_number
+                ),
+                new_payment AS (
+                    INSERT INTO public.payments (booking_id, amount, payment_method, status, transaction_reference, paid_at)
+                    SELECT nb.id, ?, ?, ?, ?, NOW()
+                    FROM new_booking nb
+                    RETURNING id
                 ),
                 available_seat AS (
                     SELECT s.seat_label
@@ -820,6 +877,10 @@ class UssdService
                     false,
                     $passengerName,
                     $phone,
+                    $totalFare,
+                    'mobile_money',
+                    'completed',
+                    $transactionReference,
                     $selectedTripId,
                     $selectedTripId,
                     $selectedTripId,
@@ -922,6 +983,27 @@ class UssdService
         } catch (\Throwable $e) {
             return null;
         }
+    }
+
+    /**
+     * Validate payment PIN entered in USSD against the profile PIN hash.
+     */
+    private function verifyPaymentPin(string $phone, string $tenantId, string $enteredPin): ?bool
+    {
+        $profile = DB::selectOne(
+            'SELECT payment_pin_hash
+             FROM public.profiles
+             WHERE phone = ? AND (tenant_id = ? OR tenant_id IS NULL)
+             ORDER BY created_at DESC
+             LIMIT 1',
+            [$phone, $tenantId]
+        );
+
+        if ($profile === null || empty($profile->payment_pin_hash)) {
+            return null;
+        }
+
+        return Hash::check($enteredPin, (string) $profile->payment_pin_hash);
     }
 
     /**
