@@ -14,10 +14,17 @@ use Illuminate\Support\Str;
  */
 class UssdService
 {
+    private SendSmsService $smsService;
+
     /**
      * Default cache TTL for USSD session keys in seconds.
      */
     private const DEFAULT_SESSION_TTL_SECONDS = 1200;
+
+    public function __construct(SendSmsService $smsService)
+    {
+        $this->smsService = $smsService;
+    }
 
     /**
      * Handle an incoming USSD request and return a USSD-compliant response string.
@@ -916,7 +923,7 @@ class UssdService
     }
 
     /**
-     * Persist booking confirmation notification payload.
+     * Persist booking confirmation notification payload and send SMS.
      *
      * @param  array{ticket_number:string,seat_label:string}  $bookingResult
      */
@@ -951,9 +958,20 @@ class UssdService
                 ]
             );
 
-            Log::info('USSD Direct Booking SMS Notification Recorded', ['phone' => $phone, 'message' => $message]);
+            Log::info('USSD Direct Booking Notification Recorded', ['phone' => $phone, 'message' => $message]);
         } catch (\Throwable $e) {
-            Log::error('Failed to record/send direct USSD SMS', ['error' => $e->getMessage()]);
+            Log::error('Failed to record USSD booking notification', ['error' => $e->getMessage()]);
+        }
+
+        // Send SMS confirmation
+        try {
+            $this->smsService->send([$phone], $message);
+            Log::info('USSD Direct Booking SMS Sent', ['phone' => $phone]);
+        } catch (\Throwable $e) {
+            Log::error('Failed to send USSD booking confirmation SMS', [
+                'phone' => $phone,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
