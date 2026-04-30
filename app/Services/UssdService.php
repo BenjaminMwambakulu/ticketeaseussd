@@ -164,7 +164,7 @@ class UssdService
     }
 
     /**
-     * Initialize booking flow and present route selection options.
+     * Initialize booking flow and present unique route options.
      *
      * @param  string  $sessionId  USSD session identifier.
      * @param  string|null  $phone  Caller MSISDN supplied by the gateway.
@@ -176,11 +176,15 @@ class UssdService
         cache()->put("ussd_{$sessionId}_phone", $phone, $this->sessionTtlSeconds());
 
         try {
-            $routes = cache()->remember(
-                'ussd_route_options_global',
+            $uniqueRoutes = cache()->remember(
+                'ussd_unique_routes',
                 $this->sessionTtlSeconds(),
                 function () {
-                    return DB::select('SELECT r.id, r.tenant_id, r.route_code, r.base_fare, t.name as tenant_name FROM public.routes r LEFT JOIN public.tenants t ON t.id = r.tenant_id ORDER BY r.id');
+                    $results = DB::select('SELECT DISTINCT r.route_code FROM public.routes r ORDER BY r.route_code');
+                    // Convert to simple strings to avoid serialization issues
+                    return array_map(function ($row) {
+                        return is_object($row) ? (string) $row->route_code : (string) $row['route_code'];
+                    }, $results);
                 }
             );
         } catch (\Exception $e) {
@@ -189,47 +193,52 @@ class UssdService
             return 'END Sorry, routes are temporarily unavailable. Please try again later.';
         }
 
-        if (empty($routes)) {
+        if (empty($uniqueRoutes)) {
             return 'END No routes are available right now. Please try again later.';
         }
 
-        $routeOptions = $this->normalizeRouteOptions($routes);
+        // Ensure we have a clean array of strings
+        $routeCodes = array_values(array_filter(array_map(function ($route) {
+            if (is_object($route)) {
+                return property_exists($route, 'route_code') ? (string) $route->route_code : null;
+            }
+            return is_array($route) ? (string) ($route['route_code'] ?? null) : (string) $route;
+        }, $uniqueRoutes)));
 
-        cache()->put("ussd_{$sessionId}_route_options", $routeOptions, $this->sessionTtlSeconds());
-        Log::info('Available routes', ['data' => $routeOptions]);
+        cache()->put("ussd_{$sessionId}_route_codes", $routeCodes, $this->sessionTtlSeconds());
 
         $response = "CON Book Ticket\nSelect route:\n";
 
-        foreach ($routeOptions as $index => $route) {
-            $response .= ($index + 1).'. '.$route['display_label']."\n";
+        foreach ($routeCodes as $index => $routeCode) {
+            $response .= ($index + 1).'. '.$routeCode."\n";
         }
 
-        $response .= (count($routeOptions) + 1).'. Back to Main Menu';
+        $response .= (count($routeCodes) + 1).'. Back to Main Menu';
 
         return $response;
     }
 
     /**
-     * Handle non-menu states that are not yet implemented.
+     * Handle non-menu states including the new booking flow.
      *
      * @param  string  $sessionId  USSD session identifier.
      * @param  string|null  $phone  Caller MSISDN supplied by the gateway.
      * @param  array<int, string>  $userInput  Parsed USSD input tokens.
      * @param  string  $state  Current cached state for the session.
-     * @return string Placeholder response until additional flows are implemented.
+     * @return string Response for the current booking step.
      */
     private function continueFlow($sessionId, $phone, $userInput, $state): string
     {
         if ($state === 'booking_route') {
-            $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
+            $routeCodes = cache()->get("ussd_{$sessionId}_route_codes", []);
 
-            if (empty($routeOptions)) {
+            if (empty($routeCodes)) {
                 return $this->startBooking($sessionId, $phone);
             }
 
             $selectedValue = $userInput[count($userInput) - 1] ?? '';
             $selectedIndex = (int) $selectedValue;
-            $backIndex = count($routeOptions) + 1;
+            $backIndex = count($routeCodes) + 1;
 
             if ($selectedIndex === $backIndex) {
                 cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
@@ -237,24 +246,15 @@ class UssdService
                 return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Register Account\n4. Exit";
             }
 
-            if ($selectedIndex < 1 || $selectedIndex > count($routeOptions)) {
+            if ($selectedIndex < 1 || $selectedIndex > count($routeCodes)) {
                 return $this->startBooking($sessionId, $phone);
             }
 
-            $selectedRoute = $routeOptions[$selectedIndex - 1];
-
-            cache()->put("ussd_{$sessionId}_selected_route_id", $selectedRoute['id'], $this->sessionTtlSeconds());
-            cache()->put("ussd_{$sessionId}_passenger_count", 1, $this->sessionTtlSeconds());
+            $selectedRouteCode = $routeCodes[$selectedIndex - 1];
+            cache()->put("ussd_{$sessionId}_selected_route_code", $selectedRouteCode, $this->sessionTtlSeconds());
             cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-            return 'CON Selected: '.$selectedRoute['display_label']."\nSingle passenger booking only.\nEnter travel date (DD-MM):";
-        }
-
-        if ($state === 'booking_passengers') {
-            cache()->put("ussd_{$sessionId}_passenger_count", 1, $this->sessionTtlSeconds());
-            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
-
-            return 'CON Single passenger booking only. Enter travel date (DD-MM):';
+            return 'CON Selected: '.$selectedRouteCode."\nEnter travel date (DD-MM):";
         }
 
         if ($state === 'booking_travel_date') {
@@ -276,7 +276,11 @@ class UssdService
 
             cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
 
-            return $this->startTripSelection($sessionId);
+            return $this->showProvidersForRouteAndDate($sessionId);
+        }
+
+        if ($state === 'booking_provider') {
+            return $this->handleProviderSelection($sessionId, $phone, $userInput);
         }
 
         if ($state === 'booking_trip') {
@@ -291,9 +295,12 @@ class UssdService
             $backIndex = count($tripOptions) + 1;
 
             if ($selectedIndex === $backIndex) {
-                cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
+                cache()->forget("ussd_{$sessionId}_provider_options");
+                cache()->forget("ussd_{$sessionId}_selected_tenant_id");
+                cache()->forget("ussd_{$sessionId}_trip_options");
+                cache()->put("ussd_{$sessionId}_state", 'booking_provider', $this->sessionTtlSeconds());
 
-                return 'CON Enter travel date (DD-MM):';
+                return $this->showProvidersForRouteAndDate($sessionId);
             }
 
             if ($selectedIndex < 1 || $selectedIndex > count($tripOptions)) {
@@ -457,7 +464,134 @@ class UssdService
     }
 
     /**
-     * Load available trips for the selected route and travel date, then show options.
+     * Show available providers (tenants) for the selected route and date.
+     * Only shows providers that have trips with available seats on that date.
+     *
+     * @param  string  $sessionId  USSD session identifier.
+     * @return string Provider selection menu.
+     */
+    private function showProvidersForRouteAndDate(string $sessionId): string
+    {
+        $selectedRouteCode = cache()->get("ussd_{$sessionId}_selected_route_code");
+        $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
+
+        if (!$selectedRouteCode || !$travelDate) {
+            cache()->put("ussd_{$sessionId}_state", 'booking_route', $this->sessionTtlSeconds());
+            return 'CON Session expired. Please select route again.';
+        }
+
+        try {
+            $providers = DB::select(
+                'SELECT DISTINCT t.id as tenant_id, 
+                        t.name as tenant_name, 
+                        r.id as route_id,
+                        r.base_fare,
+                        COUNT(DISTINCT trip.id) as trip_count
+                 FROM public.routes r
+                 JOIN public.tenants t ON t.id = r.tenant_id
+                 JOIN public.trips trip ON trip.route_id = r.id 
+                    AND DATE(trip.departure_datetime) = ?
+                    AND trip.status IN (?, ?)
+                 LEFT JOIN LATERAL (
+                     SELECT COUNT(*)::int AS assigned_seats
+                     FROM public.seat_assignments sa
+                     WHERE sa.trip_id = trip.id
+                 ) sa ON true
+                 LEFT JOIN public.buses b ON b.id = trip.bus_id
+                 WHERE r.route_code = ? 
+                   AND t.is_active = true
+                   AND GREATEST(
+                       COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
+                       0
+                   ) > 0
+                 GROUP BY t.id, t.name, r.id, r.base_fare
+                 ORDER BY t.name',
+                [$travelDate, 'scheduled', 'active', $selectedRouteCode]
+            );
+        } catch (\Exception $e) {
+            Log::error('USSD Provider Fetch Error: '.$e->getMessage());
+
+            return 'END Sorry, providers are temporarily unavailable. Please try again later.';
+        }
+
+        if (empty($providers)) {
+            cache()->forget("ussd_{$sessionId}_travel_date");
+            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
+
+            return 'CON No providers with available trips found for '.$selectedRouteCode.' on '.$travelDate.". Enter another date (DD-MM):";
+        }
+
+        $providerOptions = [];
+        foreach ($providers as $provider) {
+            $providerOptions[] = [
+                'tenant_id' => (string) $provider->tenant_id,
+                'tenant_name' => (string) $provider->tenant_name,
+                'route_id' => (int) $provider->route_id,
+                'base_fare' => (float) $provider->base_fare,
+                'trip_count' => (int) $provider->trip_count,
+            ];
+        }
+
+        cache()->put("ussd_{$sessionId}_provider_options", $providerOptions, $this->sessionTtlSeconds());
+        cache()->put("ussd_{$sessionId}_state", 'booking_provider', $this->sessionTtlSeconds());
+
+        $response = "CON Providers for {$selectedRouteCode} on {$travelDate}:\n";
+
+        foreach ($providerOptions as $index => $provider) {
+            $fareFormatted = number_format($provider['base_fare'], 0);
+            $tripsInfo = $provider['trip_count'].' trip'.($provider['trip_count'] > 1 ? 's' : '');
+            $response .= ($index + 1).'. '.$provider['tenant_name']." (MK {$fareFormatted}, {$tripsInfo})\n";
+        }
+
+        $response .= (count($providerOptions) + 1).'. Change date';
+
+        return $response;
+    }
+
+    /**
+     * Handle provider selection and show available trips.
+     *
+     * @param  string  $sessionId  USSD session identifier.
+     * @param  string|null  $phone  Caller MSISDN.
+     * @param  array<int, string>  $userInput  Parsed USSD input tokens.
+     * @return string Trip selection menu.
+     */
+    private function handleProviderSelection(string $sessionId, ?string $phone, array $userInput): string
+    {
+        $providerOptions = cache()->get("ussd_{$sessionId}_provider_options", []);
+
+        if (empty($providerOptions)) {
+            return $this->showProvidersForRouteAndDate($sessionId);
+        }
+
+        $selectedValue = $this->currentInputValue($userInput);
+        $selectedIndex = (int) $selectedValue;
+        $backIndex = count($providerOptions) + 1;
+
+        if ($selectedIndex === $backIndex) {
+            cache()->forget("ussd_{$sessionId}_provider_options");
+            cache()->forget("ussd_{$sessionId}_travel_date");
+            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
+
+            return 'CON Enter travel date (DD-MM):';
+        }
+
+        if ($selectedIndex < 1 || $selectedIndex > count($providerOptions)) {
+            return $this->showProvidersForRouteAndDate($sessionId);
+        }
+
+        $selectedProvider = $providerOptions[$selectedIndex - 1];
+
+        cache()->put("ussd_{$sessionId}_selected_route_id", $selectedProvider['route_id'], $this->sessionTtlSeconds());
+        cache()->put("ussd_{$sessionId}_selected_tenant_id", $selectedProvider['tenant_id'], $this->sessionTtlSeconds());
+        cache()->put("ussd_{$sessionId}_base_fare", $selectedProvider['base_fare'], $this->sessionTtlSeconds());
+        cache()->put("ussd_{$sessionId}_passenger_count", 1, $this->sessionTtlSeconds());
+
+        return $this->startTripSelection($sessionId);
+    }
+
+    /**
+     * Load available trips for the selected route, date, and provider, then show options.
      *
      * @param  string  $sessionId  USSD session identifier.
      * @return string Trip selection response.
@@ -465,46 +599,48 @@ class UssdService
     private function startTripSelection(string $sessionId): string
     {
         $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
+        $selectedTenantId = cache()->get("ussd_{$sessionId}_selected_tenant_id");
         $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
 
-        if ($selectedRouteId === null || $travelDate === null) {
+        if ($selectedRouteId === null || $travelDate === null || $selectedTenantId === null) {
             cache()->put("ussd_{$sessionId}_state", 'booking_route', $this->sessionTtlSeconds());
 
             return 'CON Booking session expired. Please select route again.';
         }
 
-        $tripCacheKey = "ussd_trip_options_route_{$selectedRouteId}_date_{$travelDate}";
+        $tripCacheKey = "ussd_trip_options_route_{$selectedRouteId}_tenant_{$selectedTenantId}_date_{$travelDate}";
 
         try {
             $tripOptions = cache()->remember(
                 $tripCacheKey,
                 $this->sessionTtlSeconds(),
-                function () use ($selectedRouteId, $travelDate) {
+                function () use ($selectedRouteId, $selectedTenantId, $travelDate) {
                     $trips = DB::select(
-                        'SELECT *
-                         FROM (
-                            SELECT t.id,
-                                   t.departure_datetime,
-                                   t.status,
-                                   GREATEST(
-                                       COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
-                                       0
-                                   ) AS available_seats
-                            FROM public.trips t
-                            LEFT JOIN public.buses b ON b.id = t.bus_id
-                            LEFT JOIN LATERAL (
-                                SELECT COUNT(*)::int AS assigned_seats
-                                FROM public.seat_assignments s
-                                WHERE s.trip_id = t.id
-                            ) sa ON true
-                            WHERE t.route_id = ?
-                              AND DATE(t.departure_datetime) = ?
-                              AND t.status IN (?, ?)
-                         ) trip_rows
-                         WHERE trip_rows.available_seats > 0
-                         ORDER BY trip_rows.departure_datetime
+                        'SELECT t.id,
+                                t.departure_datetime,
+                                t.status,
+                                GREATEST(
+                                    COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
+                                    0
+                                ) AS available_seats
+                         FROM public.trips t
+                         LEFT JOIN public.buses b ON b.id = t.bus_id
+                         LEFT JOIN LATERAL (
+                             SELECT COUNT(*)::int AS assigned_seats
+                             FROM public.seat_assignments s
+                             WHERE s.trip_id = t.id
+                         ) sa ON true
+                         WHERE t.route_id = ?
+                           AND t.tenant_id = ?
+                           AND DATE(t.departure_datetime) = ?
+                           AND t.status IN (?, ?)
+                           AND GREATEST(
+                               COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
+                               0
+                           ) > 0
+                         ORDER BY t.departure_datetime
                          LIMIT 20',
-                        [$selectedRouteId, $travelDate, 'scheduled', 'active']
+                        [$selectedRouteId, $selectedTenantId, $travelDate, 'scheduled', 'active']
                     );
 
                     return $this->normalizeTripOptions($trips);
@@ -517,6 +653,7 @@ class UssdService
                 Log::warning('USSD Trip Fetch Error, serving cached trips', [
                     'error' => $e->getMessage(),
                     'route_id' => $selectedRouteId,
+                    'tenant_id' => $selectedTenantId,
                     'travel_date' => $travelDate,
                 ]);
             } else {
@@ -529,21 +666,33 @@ class UssdService
         $tripOptions = $this->normalizeTripOptions($tripOptions);
 
         if (empty($tripOptions)) {
-            cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
+            cache()->forget("ussd_{$sessionId}_provider_options");
+            cache()->forget("ussd_{$sessionId}_selected_tenant_id");
+            cache()->put("ussd_{$sessionId}_state", 'booking_provider', $this->sessionTtlSeconds());
 
-            return 'CON No trips with available seats found for that date. Enter another date (DD-MM-YYYY):';
+            return 'CON No trips with available seats found for this provider on that date. Please select another provider:';
         }
 
         cache()->put("ussd_{$sessionId}_trip_options", $tripOptions, $this->sessionTtlSeconds());
         cache()->put("ussd_{$sessionId}_state", 'booking_trip', $this->sessionTtlSeconds());
 
-        $response = "CON Select trip:\n";
+        $selectedProvider = null;
+        foreach (cache()->get("ussd_{$sessionId}_provider_options", []) as $provider) {
+            if ($provider['tenant_id'] === $selectedTenantId) {
+                $selectedProvider = $provider;
+                break;
+            }
+        }
+
+        $providerName = $selectedProvider ? $selectedProvider['tenant_name'] : 'Selected Provider';
+
+        $response = "CON Select trip for {$providerName}:\n";
 
         foreach ($tripOptions as $index => $trip) {
             $response .= ($index + 1).'. '.$trip['display_label']."\n";
         }
 
-        $response .= (count($tripOptions) + 1).'. Change travel date';
+        $response .= (count($tripOptions) + 1).'. Change provider';
 
         return $response;
     }
@@ -611,8 +760,12 @@ class UssdService
      */
     private function clearBookingSessionData(string $sessionId): void
     {
-        cache()->forget("ussd_{$sessionId}_route_options");
+        cache()->forget("ussd_{$sessionId}_route_codes");
+        cache()->forget("ussd_{$sessionId}_selected_route_code");
+        cache()->forget("ussd_{$sessionId}_provider_options");
         cache()->forget("ussd_{$sessionId}_selected_route_id");
+        cache()->forget("ussd_{$sessionId}_selected_tenant_id");
+        cache()->forget("ussd_{$sessionId}_base_fare");
         cache()->forget("ussd_{$sessionId}_trip_options");
         cache()->forget("ussd_{$sessionId}_selected_trip_id");
         cache()->forget("ussd_{$sessionId}_passenger_count");
@@ -629,17 +782,11 @@ class UssdService
         $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
         $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
         $passengerCount = (int) cache()->get("ussd_{$sessionId}_passenger_count", 1);
-        $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
-        $selectedRoute = null;
+        $tenantId = cache()->get("ussd_{$sessionId}_selected_tenant_id");
+        $baseFare = (float) cache()->get("ussd_{$sessionId}_base_fare", 0);
+        $selectedRouteCode = cache()->get("ussd_{$sessionId}_selected_route_code", '');
 
-        foreach ($routeOptions as $route) {
-            if ((string) ($route['id'] ?? '') === (string) $selectedRouteId) {
-                $selectedRoute = $route;
-                break;
-            }
-        }
-
-        if ($selectedRoute === null || $selectedTripId === null || $travelDate === null) {
+        if ($selectedRouteId === null || $selectedTripId === null || $travelDate === null || $tenantId === null) {
             throw new \RuntimeException('Booking session expired. Please start again.');
         }
 
@@ -649,10 +796,10 @@ class UssdService
             bookingData: [
                 'route_id' => $selectedRouteId,
                 'trip_id' => $selectedTripId,
-                'tenant_id' => (string) ($selectedRoute['tenant_id'] ?? ''),
-                'route_code' => (string) ($selectedRoute['route_code'] ?? ''),
+                'tenant_id' => (string) $tenantId,
+                'route_code' => (string) $selectedRouteCode,
                 'travel_date' => (string) $travelDate,
-                'total_fare' => (float) ($selectedRoute['base_fare'] ?? 0) * $passengerCount,
+                'total_fare' => $baseFare * $passengerCount,
                 'passenger_count' => $passengerCount,
                 'passenger_name' => $this->resolvePassengerFullName($sessionId, $phone),
                 'payment_pin' => $enteredPin,
