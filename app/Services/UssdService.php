@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Jobs\ProcessUssdBooking;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -38,8 +39,6 @@ class UssdService
         $phoneNumber = $request->input('phoneNumber');
         $text = $request->input('text');
 
-        Log::info('USSD Request', $request->all());
-
         $userInput = $text ? explode('*', $text) : [];
         $state = cache()->get("ussd_{$sessionId}_state", 'start');
 
@@ -47,8 +46,8 @@ class UssdService
             $response = "CON Welcome to TicketEase!\n\n";
             $response .= "1. Book Ticket\n";
             $response .= "2. My Bookings\n";
-            $response .= "5. Register Account\n";
-            $response .= '6. Exit';
+            $response .= "3. Register Account\n";
+            $response .= '4. Exit';
 
             cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
             cache()->put("ussd_{$sessionId}_phone", $phoneNumber, $this->sessionTtlSeconds());
@@ -57,7 +56,7 @@ class UssdService
         }
 
         if ($state === 'menu') {
-            $choice = $userInput[0] ?? '';
+            $choice = $this->currentInputValue($userInput);
 
             if ($choice == '1') {
                 return $this->startBooking($sessionId, $phoneNumber);
@@ -70,17 +69,17 @@ class UssdService
                 return $this->showMyBookingsPage($sessionId, $phoneNumber, 1);
             }
 
-            if ($choice == '5') {
+            if ($choice == '3') {
                 return $this->handleRegistration($sessionId, $phoneNumber, $userInput);
             }
 
-            if ($choice == '6') {
+            if ($choice == '4') {
                 cache()->forget("ussd_{$sessionId}_state");
 
                 return 'END Thank you for using TicketEase. Safe travels!';
             }
 
-            return "CON Invalid option. Please try again.\n\n1. Book Ticket\n2. My Bookings\n5. Register Account\n6. Exit";
+            return "CON Invalid option. Please try again.\n\n1. Book Ticket\n2. My Bookings\n3. Register Account\n4. Exit";
         }
 
         return $this->continueFlow($sessionId, $phoneNumber, $userInput, $state);
@@ -235,7 +234,7 @@ class UssdService
             if ($selectedIndex === $backIndex) {
                 cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
 
-                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n5. Register Account\n6. Exit";
+                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Register Account\n4. Exit";
             }
 
             if ($selectedIndex < 1 || $selectedIndex > count($routeOptions)) {
@@ -248,31 +247,31 @@ class UssdService
             cache()->put("ussd_{$sessionId}_passenger_count", 1, $this->sessionTtlSeconds());
             cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-            return 'CON Selected: '.$selectedRoute['display_label']."\nSingle passenger booking only.\nEnter travel date (DD-MM-YYYY):";
+            return 'CON Selected: '.$selectedRoute['display_label']."\nSingle passenger booking only.\nEnter travel date (DD-MM):";
         }
 
         if ($state === 'booking_passengers') {
             cache()->put("ussd_{$sessionId}_passenger_count", 1, $this->sessionTtlSeconds());
             cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-            return 'CON Single passenger booking only. Enter travel date (DD-MM-YYYY):';
+            return 'CON Single passenger booking only. Enter travel date (DD-MM):';
         }
 
         if ($state === 'booking_travel_date') {
             $travelDateInput = $this->currentInputValue($userInput);
 
-            if (! preg_match('/^\d{2}-\d{2}-\d{4}$/', $travelDateInput)) {
-                return 'CON Invalid date format. Enter as DD-MM-YYYY:';
+            if (! preg_match('/^\d{2}-\d{2}$/', $travelDateInput)) {
+                return 'CON Invalid date format. Enter as DD-MM:';
             }
 
             try {
-                $travelDate = Carbon::createFromFormat('d-m-Y', $travelDateInput)->startOfDay();
+                $travelDate = Carbon::createFromFormat('d-m', $travelDateInput)->year(Carbon::now()->year)->startOfDay();
             } catch (\Exception $e) {
-                return 'CON Invalid date. Enter travel date as DD-MM-YYYY:';
+                return 'CON Invalid date. Enter travel date as DD-MM:';
             }
 
             if ($travelDate->lt(Carbon::today())) {
-                return 'CON Travel date cannot be in the past. Enter DD-MM-YYYY:';
+                return 'CON Travel date cannot be in the past. Enter DD-MM:';
             }
 
             cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
@@ -294,7 +293,7 @@ class UssdService
             if ($selectedIndex === $backIndex) {
                 cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
 
-                return 'CON Enter travel date (DD-MM-YYYY):';
+                return 'CON Enter travel date (DD-MM):';
             }
 
             if ($selectedIndex < 1 || $selectedIndex > count($tripOptions)) {
@@ -338,69 +337,19 @@ class UssdService
                 return 'CON Invalid PIN format. Enter your 4-digit payment PIN:';
             }
 
-            $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
-            $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
-            $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
-            $passengerCount = (int) cache()->get("ussd_{$sessionId}_passenger_count", 1);
-
-            $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
-            $selectedRoute = null;
-            foreach ($routeOptions as $route) {
-                if ((string) ($route['id'] ?? '') === (string) $selectedRouteId) {
-                    $selectedRoute = $route;
-                    break;
-                }
-            }
-
-            if (! $selectedRoute || ! $selectedTripId) {
-                return 'END Your booking session has expired. Please dial again to start over.';
-            }
-
-            $tenantId = (string) ($selectedRoute['tenant_id'] ?? '');
-            $pinVerification = $this->verifyPaymentPin((string) $phone, $tenantId, $enteredPin);
-
-            if ($pinVerification === null) {
-                $this->clearBookingSessionData($sessionId);
-
-                return 'END No payment PIN found for your account. Please register first to set your PIN.';
-            }
-
-            if (! $pinVerification) {
-                return 'CON Incorrect PIN. Please enter your 4-digit payment PIN:';
-            }
-
-            $passengerName = $this->resolvePassengerFullName($sessionId, (string) $phone);
-            $totalFare = (float) ($selectedRoute['base_fare'] ?? 0) * $passengerCount;
-
             try {
-                $bookingResult = $this->processBookingImmediately($sessionId, (string) $phone, [
-                    'route_id' => $selectedRouteId,
-                    'trip_id' => $selectedTripId,
-                    'tenant_id' => $tenantId,
-                    'route_code' => (string) ($selectedRoute['route_code'] ?? ''),
-                    'travel_date' => (string) $travelDate,
-                    'total_fare' => $totalFare,
-                    'passenger_count' => $passengerCount,
-                    'passenger_name' => $passengerName,
-                ]);
-
+                $this->queueBookingConfirmation($sessionId, (string) $phone, $enteredPin);
                 $this->clearBookingSessionData($sessionId);
 
-                return "END Thank you!\n"
-                    ."Your booking is confirmed.\n"
-                    .'Ticket: '.$bookingResult['ticket_number']."\n"
-                    .'Seat: '.$bookingResult['seat_label'];
+                return 'END Booking request received. You will receive an SMS confirmation shortly.';
             } catch (\Throwable $e) {
                 Log::error('USSD Direct Booking Failed', [
                     'session_id' => $sessionId,
                     'phone' => $phone,
-                    'trip_id' => $selectedTripId,
                     'error' => $e->getMessage(),
                 ]);
 
-                $this->clearBookingSessionData($sessionId);
-
-                return 'END Sorry, booking failed right now. Please try again later.';
+                return 'END Sorry, booking could not be queued right now. Please try again.';
             }
         }
 
@@ -418,7 +367,7 @@ class UssdService
                 cache()->forget("ussd_{$sessionId}_my_bookings_page");
                 cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
 
-                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n5. Register Account\n6. Exit";
+                return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Register Account\n4. Exit";
             }
 
             return 'CON Invalid option.\n1. More\n2. Main Menu';
@@ -669,6 +618,46 @@ class UssdService
         cache()->forget("ussd_{$sessionId}_passenger_count");
         cache()->forget("ussd_{$sessionId}_travel_date");
         cache()->forget("ussd_{$sessionId}_state");
+    }
+
+    /**
+     * Queue the booking work so the USSD response can return immediately.
+     */
+    private function queueBookingConfirmation(string $sessionId, string $phone, string $enteredPin): void
+    {
+        $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
+        $selectedTripId = cache()->get("ussd_{$sessionId}_selected_trip_id");
+        $travelDate = cache()->get("ussd_{$sessionId}_travel_date");
+        $passengerCount = (int) cache()->get("ussd_{$sessionId}_passenger_count", 1);
+        $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
+        $selectedRoute = null;
+
+        foreach ($routeOptions as $route) {
+            if ((string) ($route['id'] ?? '') === (string) $selectedRouteId) {
+                $selectedRoute = $route;
+                break;
+            }
+        }
+
+        if ($selectedRoute === null || $selectedTripId === null || $travelDate === null) {
+            throw new \RuntimeException('Booking session expired. Please start again.');
+        }
+
+        ProcessUssdBooking::dispatch(
+            sessionId: $sessionId,
+            phone: $phone,
+            bookingData: [
+                'route_id' => $selectedRouteId,
+                'trip_id' => $selectedTripId,
+                'tenant_id' => (string) ($selectedRoute['tenant_id'] ?? ''),
+                'route_code' => (string) ($selectedRoute['route_code'] ?? ''),
+                'travel_date' => (string) $travelDate,
+                'total_fare' => (float) ($selectedRoute['base_fare'] ?? 0) * $passengerCount,
+                'passenger_count' => $passengerCount,
+                'passenger_name' => $this->resolvePassengerFullName($sessionId, $phone),
+                'payment_pin' => $enteredPin,
+            ]
+        );
     }
 
     /**

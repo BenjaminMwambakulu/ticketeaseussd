@@ -2,13 +2,16 @@
 
 namespace App\Jobs;
 
+use App\Services\SendSmsService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Throwable;
 
 /**
@@ -24,7 +27,7 @@ class ProcessUssdBooking implements ShouldQueue
      * Use a relatively low number for USSD to avoid double bookings if not careful,
      * though advisory locks help prevent this.
      */
-    public $tries = 3;
+    public $tries = 1;
 
     /**
      * The number of seconds the job can run before timing out.
@@ -49,7 +52,7 @@ class ProcessUssdBooking implements ShouldQueue
     /**
      * Execute the job.
      */
-    public function handle(): void
+    public function handle(SendSmsService $smsService): void
     {
         Log::info('Processing USSD Booking Job', [
             'session_id' => $this->sessionId,
@@ -65,110 +68,172 @@ class ProcessUssdBooking implements ShouldQueue
         $totalFare = $this->bookingData['total_fare'];
         $passengerCount = $this->bookingData['passenger_count'] ?? 1;
         $passengerName = $this->bookingData['passenger_name'] ?? 'Passenger';
+        $enteredPin = (string) ($this->bookingData['payment_pin'] ?? '');
+
+
+
+        $selectedRouteId = $this->bookingData['route_id'];
+        $selectedTripId = $this->bookingData['trip_id'];
+        $tenantId = $this->bookingData['tenant_id'];
+        $routeCode = $this->bookingData['route_code'];
+        $travelDate = $this->bookingData['travel_date'];
+        $totalFare = $this->bookingData['total_fare'];
+        $passengerCount = (int) ($this->bookingData['passenger_count'] ?? 1);
+        $passengerName = (string) ($this->bookingData['passenger_name'] ?? 'Passenger');
+
+        Log::info('Processing USSD booking asynchronously', [
+            'session_id' => $this->sessionId,
+            'phone' => $this->phone,
+            'trip_id' => $selectedTripId,
+        ]);
+
+        $profile = DB::selectOne(
+            'SELECT id, payment_pin_hash
+             FROM public.profiles
+             WHERE phone = ? AND (tenant_id = ? OR tenant_id IS NULL)
+             ORDER BY created_at DESC
+             LIMIT 1',
+            [$this->phone, $tenantId]
+        );
+
+        if ($profile === null || empty($profile->payment_pin_hash)) {
+            throw new \RuntimeException('No payment PIN found for this account.');
+        }
+
+        if (! Hash::check($enteredPin, (string) $profile->payment_pin_hash)) {
+            throw new \RuntimeException('Incorrect payment PIN.');
+        }
+
+        $bookingResult = DB::transaction(function () use (
+            $selectedTripId,
+            $tenantId,
+            $selectedRouteId,
+            $passengerCount,
+            $totalFare,
+            $passengerName
+        ) {
+            $transactionReference = 'USSD-'.strtoupper(substr(str_replace('-', '', (string) Str::uuid()), 0, 12));
+
+            $result = DB::selectOne(
+                'WITH lock_trip AS (
+                    SELECT pg_advisory_xact_lock(?::bigint)
+                ),
+                new_booking AS (
+                    INSERT INTO public.bookings (tenant_id, trip_id, route_id, booking_type, total_passengers, total_fare, status, is_open_ticket)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?::boolean)
+                    RETURNING id
+                ),
+                new_passenger AS (
+                    INSERT INTO public.booking_passengers (booking_id, name, contact_phone)
+                    SELECT nb.id, ?, ?
+                    FROM new_booking nb
+                    RETURNING id, ticket_number
+                ),
+                new_payment AS (
+                    INSERT INTO public.payments (booking_id, amount, payment_method, status, transaction_reference, paid_at)
+                    SELECT nb.id, ?, ?, ?, ?, NOW()
+                    FROM new_booking nb
+                    RETURNING id
+                ),
+                available_seat AS (
+                    SELECT s.seat_label
+                    FROM (
+                        SELECT jsonb_array_elements_text(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)) AS seat_label
+                        FROM public.trips t
+                        JOIN public.buses b ON b.id = t.bus_id
+                        WHERE t.id = ?
+                    ) s
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM public.seat_assignments sa
+                        WHERE sa.trip_id = ?
+                          AND sa.seat_label = s.seat_label
+                    )
+                    ORDER BY s.seat_label
+                    LIMIT 1
+                ),
+                new_assignment AS (
+                    INSERT INTO public.seat_assignments (trip_id, booking_passenger_id, seat_label)
+                    SELECT ?, np.id, a.seat_label
+                    FROM new_passenger np
+                    JOIN available_seat a ON true
+                    RETURNING seat_label
+                )
+                SELECT np.ticket_number, na.seat_label
+                FROM new_passenger np
+                JOIN new_assignment na ON true
+                LIMIT 1',
+                [
+                    $selectedTripId,
+                    $tenantId,
+                    $selectedTripId,
+                    $selectedRouteId,
+                    'ussd',
+                    $passengerCount,
+                    $totalFare,
+                    'confirmed',
+                    false,
+                    $passengerName,
+                    $this->phone,
+                    $totalFare,
+                    'mobile_money',
+                    'completed',
+                    $transactionReference,
+                    $selectedTripId,
+                    $selectedTripId,
+                    $selectedTripId,
+                ]
+            );
+
+            if ($result === null || empty($result->seat_label)) {
+                throw new \RuntimeException("No available seats left for trip ID: {$selectedTripId}");
+            }
+
+            return [
+                'ticket_number' => (string) ($result->ticket_number ?? 'PENDING'),
+                'seat_label' => (string) $result->seat_label,
+            ];
+        });
+
+        // Fetch provider name from tenants table
+        $tenant = DB::selectOne('SELECT name FROM public.tenants WHERE id = ?', [$tenantId]);
+        $providerName = $tenant->name ?? 'Provider';
+
+        $message = "TicketEase: Booking confirmed for {$passengerName} on {$travelDate}. Provider: {$providerName}. Ticket: {$bookingResult['ticket_number']}. Seat: {$bookingResult['seat_label']}. Route: {$routeCode}. Safe travels!";
+
+        DB::insert(
+            'INSERT INTO public.notifications (profile_id, title, message, category, metadata, tenant_id)
+             VALUES (?, ?, ?, ?, ?, ?)',
+            [
+                (string) $profile->id,
+                'Booking Confirmed',
+                $message,
+                'booking',
+                json_encode([
+                    'ticket_number' => $bookingResult['ticket_number'],
+                    'seat_label' => $bookingResult['seat_label'],
+                    'route_code' => $routeCode,
+                    'travel_date' => $travelDate,
+                ]),
+                $tenantId,
+            ]
+        );
 
         try {
-            $bookingResult = DB::transaction(function () use (
-                $selectedTripId, 
-                $tenantId, 
-                $selectedRouteId, 
-                $passengerCount, 
-                $totalFare, 
-                $passengerName
-            ) {
-                // Perform the complex insert with advisory lock to ensure seat safety
-                $result = DB::selectOne(
-                    'WITH lock_trip AS (
-                        -- Use session-level advisory lock on trip ID to prevent race conditions during seat assignment
-                        SELECT pg_advisory_xact_lock(?::bigint)
-                    ),
-                    new_booking AS (
-                        INSERT INTO public.bookings (tenant_id, trip_id, route_id, booking_type, total_passengers, total_fare, status, is_open_ticket)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        RETURNING id
-                    ),
-                    new_passenger AS (
-                        INSERT INTO public.booking_passengers (booking_id, name, contact_phone)
-                        SELECT nb.id, ?, ?
-                        FROM new_booking nb
-                        RETURNING id, ticket_number
-                    ),
-                    available_seat AS (
-                        -- Find the first available seat for this trip
-                        SELECT s.seat_label
-                        FROM (
-                            SELECT jsonb_array_elements_text(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)) AS seat_label
-                            FROM public.trips t
-                            JOIN public.buses b ON b.id = t.bus_id
-                            WHERE t.id = ?
-                        ) s
-                        WHERE NOT EXISTS (
-                            SELECT 1
-                            FROM public.seat_assignments sa
-                            WHERE sa.trip_id = ?
-                              AND sa.seat_label = s.seat_label
-                        )
-                        ORDER BY s.seat_label
-                        LIMIT 1
-                    ),
-                    new_assignment AS (
-                        -- Assign the found seat to the passenger
-                        INSERT INTO public.seat_assignments (trip_id, booking_passenger_id, seat_label)
-                        SELECT ?, np.id, a.seat_label
-                        FROM new_passenger np
-                        JOIN available_seat a ON true
-                        RETURNING seat_label
-                    )
-                    SELECT np.ticket_number, na.seat_label
-                    FROM new_passenger np
-                    JOIN new_assignment na ON true
-                    LIMIT 1',
-                    [
-                        $selectedTripId,
-                        $tenantId,
-                        $selectedTripId,
-                        $selectedRouteId,
-                        'ussd',
-                        $passengerCount,
-                        $totalFare,
-                        'confirmed',
-                        false,
-                        $passengerName,
-                        $this->phone,
-                        $selectedTripId,
-                        $selectedTripId,
-                        $selectedTripId,
-                    ]
-                );
-
-                if ($result === null || empty($result->seat_label)) {
-                    throw new \RuntimeException("No available seats left for trip ID: {$selectedTripId}");
-                }
-
-                return [
-                    'ticket_number' => (string) ($result->ticket_number ?? 'PENDING'),
-                    'seat_label' => (string) $result->seat_label,
-                ];
-            });
-
-            Log::info('USSD Booking Job Successful', [
+            $smsService->send([$this->phone], $message)->throw();
+        } catch (Throwable $smsError) {
+            Log::warning('USSD booking SMS failed', [
                 'session_id' => $this->sessionId,
-                'ticket' => $bookingResult['ticket_number'],
-                'seat' => $bookingResult['seat_label'],
+                'phone' => $this->phone,
+                'error' => $smsError->getMessage(),
             ]);
-
-            // Save notification and Trigger SMS
-            $this->sendConfirmationSms($bookingResult, $tenantId, $routeCode, $travelDate, $passengerName);
-
-        } catch (Throwable $e) {
-            Log::error('USSD Booking Job Failed', [
-                'session_id' => $this->sessionId,
-                'error' => $e->getMessage(),
-                'phone' => $this->phone
-            ]);
-            
-            // Re-throw to allow Laravel queue to handle retries
-            throw $e;
         }
+
+        Log::info('USSD booking job completed', [
+            'session_id' => $this->sessionId,
+            'ticket' => $bookingResult['ticket_number'],
+            'seat' => $bookingResult['seat_label'],
+        ]);
     }
 
     /**
@@ -178,7 +243,11 @@ class ProcessUssdBooking implements ShouldQueue
     {
         $profileId = $this->resolveProfileId($this->phone, $passengerName, $tenantId);
 
-        $message = "TicketEase: Booking confirmed for {$passengerName} on {$travelDate}. Ticket: {$bookingResult['ticket_number']}. Seat: {$bookingResult['seat_label']}. Route: {$routeCode}. Safe travels!";
+        // Fetch provider name from tenants table
+        $tenant = DB::selectOne('SELECT name FROM public.tenants WHERE id = ?', [$tenantId]);
+        $providerName = $tenant->name ?? 'Provider';
+
+        $message = "TicketEase: Booking confirmed for {$passengerName} on {$travelDate}. Provider: {$providerName}. Ticket: {$bookingResult['ticket_number']}. Seat: {$bookingResult['seat_label']}. Route: {$routeCode}. Safe travels!";
 
         try {
             // 1. Record in notifications table

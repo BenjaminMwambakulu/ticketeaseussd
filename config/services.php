@@ -36,9 +36,12 @@ return [
     ],
 
     'textbee' => [
-    'api_key' => env('TEXTBEE_API_KEY'),
-    'base_url' => env('TEXTBEE_BASE_URL'),
-    'device_id' => env('TEXTBEE_DEVICE_ID'),
+        'api_key' => env('TEXTBEE_API_KEY'),
+        'base_url' => env('TEXTBEE_BASE_URL'),
+        'device_id' => env('TEXTBEE_DEVICE_ID'),
+        'timeout_seconds' => env('TEXTBEE_TIMEOUT_SECONDS', 5),
+        'connect_timeout_seconds' => env('TEXTBEE_CONNECT_TIMEOUT_SECONDS', 2),
+        'http_retries' => env('TEXTBEE_HTTP_RETRIES', 1),
     ],
 
 ];
