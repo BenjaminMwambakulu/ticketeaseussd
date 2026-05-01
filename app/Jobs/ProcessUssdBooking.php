@@ -66,25 +66,16 @@ class ProcessUssdBooking implements ShouldQueue
         $routeCode = $this->bookingData['route_code'];
         $travelDate = $this->bookingData['travel_date'];
         $totalFare = $this->bookingData['total_fare'];
-        $passengerCount = $this->bookingData['passenger_count'] ?? 1;
-        $passengerName = $this->bookingData['passenger_name'] ?? 'Passenger';
-        $enteredPin = (string) ($this->bookingData['payment_pin'] ?? '');
-
-
-
-        $selectedRouteId = $this->bookingData['route_id'];
-        $selectedTripId = $this->bookingData['trip_id'];
-        $tenantId = $this->bookingData['tenant_id'];
-        $routeCode = $this->bookingData['route_code'];
-        $travelDate = $this->bookingData['travel_date'];
-        $totalFare = $this->bookingData['total_fare'];
         $passengerCount = (int) ($this->bookingData['passenger_count'] ?? 1);
         $passengerName = (string) ($this->bookingData['passenger_name'] ?? 'Passenger');
+        $enteredPin = (string) ($this->bookingData['payment_pin'] ?? '');
 
         Log::info('Processing USSD booking asynchronously', [
             'session_id' => $this->sessionId,
             'phone' => $this->phone,
             'trip_id' => $selectedTripId,
+            'route_id' => $selectedRouteId,
+            'tenant_id' => $tenantId,
         ]);
 
         $profile = DB::selectOne(
@@ -96,13 +87,18 @@ class ProcessUssdBooking implements ShouldQueue
             [$this->phone, $tenantId]
         );
 
+        Log::debug('Verifying payment PIN for USSD booking', ['phone' => $this->phone, 'session_id' => $this->sessionId]);
         if ($profile === null || empty($profile->payment_pin_hash)) {
+            Log::error('USSD Booking Failed: No payment PIN found', ['phone' => $this->phone, 'session_id' => $this->sessionId]);
             throw new \RuntimeException('No payment PIN found for this account.');
         }
 
         if (! Hash::check($enteredPin, (string) $profile->payment_pin_hash)) {
+            Log::error('USSD Booking Failed: Incorrect payment PIN', ['phone' => $this->phone, 'session_id' => $this->sessionId]);
             throw new \RuntimeException('Incorrect payment PIN.');
         }
+
+        Log::info('Starting database transaction for USSD booking', ['session_id' => $this->sessionId]);
 
         $bookingResult = DB::transaction(function () use (
             $selectedTripId,
@@ -234,76 +230,5 @@ class ProcessUssdBooking implements ShouldQueue
             'ticket' => $bookingResult['ticket_number'],
             'seat' => $bookingResult['seat_label'],
         ]);
-    }
-
-    /**
-     * Create a notification record and send/queue the SMS.
-     */
-    protected function sendConfirmationSms(array $bookingResult, string $tenantId, string $routeCode, string $travelDate, string $passengerName): void
-    {
-        $profileId = $this->resolveProfileId($this->phone, $passengerName, $tenantId);
-
-        // Fetch provider name from tenants table
-        $tenant = DB::selectOne('SELECT name FROM public.tenants WHERE id = ?', [$tenantId]);
-        $providerName = $tenant->name ?? 'Provider';
-
-        $message = "TicketEase: Booking confirmed for {$passengerName} on {$travelDate}. Provider: {$providerName}. Ticket: {$bookingResult['ticket_number']}. Seat: {$bookingResult['seat_label']}. Route: {$routeCode}. Safe travels!";
-
-        try {
-            // 1. Record in notifications table
-            DB::insert(
-                'INSERT INTO public.notifications (profile_id, title, message, category, metadata, tenant_id)
-                 VALUES (?, ?, ?, ?, ?, ?)',
-                [
-                    $profileId,
-                    'Booking Confirmed',
-                    $message,
-                    'booking',
-                    json_encode([
-                        'ticket_number' => $bookingResult['ticket_number'],
-                        'seat_label' => $bookingResult['seat_label'],
-                        'route_code' => $routeCode,
-                        'travel_date' => $travelDate,
-                    ]),
-                    $tenantId,
-                ]
-            );
-
-            // 2. Dispatch SMS (Integration point)
-            // Example: Http::post('https://api.africastalking.com/...', [...]);
-            Log::info('SMS Notification Queued/Sent', ['phone' => $this->phone, 'message' => $message]);
-
-        } catch (Throwable $e) {
-            Log::error('Failed to record/send USSD SMS', ['error' => $e->getMessage()]);
-        }
-    }
-
-    /**
-     * Resolve or create a profile ID for the notification.
-     */
-    protected function resolveProfileId(string $phone, string $fullName, string $tenantId): ?string
-    {
-        try {
-            $profile = DB::selectOne(
-                'SELECT id FROM public.profiles WHERE phone = ? AND (tenant_id = ? OR tenant_id IS NULL) ORDER BY created_at DESC LIMIT 1',
-                [$phone, $tenantId]
-            );
-
-            if ($profile !== null && ! empty($profile->id)) {
-                return (string) $profile->id;
-            }
-
-            // Fallback: create a minimal profile
-            $result = DB::selectOne('SELECT public.get_or_create_profile(?, ?, ?, ?) AS id', [
-                $fullName,
-                $phone,
-                null, // national_id
-                $tenantId,
-            ]);
-
-            return $result !== null && ! empty($result->id) ? (string) $result->id : null;
-        } catch (Throwable $e) {
-            return null;
-        }
     }
 }

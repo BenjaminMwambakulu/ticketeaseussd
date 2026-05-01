@@ -24,8 +24,8 @@ class SendSmsService {
      */
     public function send(array $recipients, string $message)
     {
-        return Http::timeout((int) config('services.textbee.timeout_seconds', 5))
-            ->connectTimeout((int) config('services.textbee.connect_timeout_seconds', 2))
+        $response = Http::timeout((int) config('services.textbee.timeout_seconds', 15))
+            ->connectTimeout((int) config('services.textbee.connect_timeout_seconds', 10))
             ->retry((int) config('services.textbee.http_retries', 1), 200)
             ->withHeaders([
                 'x-api-key' => $this->apiKey,
@@ -37,5 +37,13 @@ class SendSmsService {
                     'message' => $message,
                 ]
             );
+
+        \Illuminate\Support\Facades\Log::info('TextBee SMS Response', [
+            'status' => $response->status(),
+            'body' => $response->json(),
+            'recipients' => $recipients
+        ]);
+
+        return $response;
     }
 }

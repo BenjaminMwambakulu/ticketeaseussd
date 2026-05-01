@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Jobs\FinalizeUssdRegistration;
 use App\Jobs\ProcessUssdBooking;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
@@ -35,6 +36,7 @@ class UssdService
      */
     public function handle(Request $request): string
     {
+        $startTime = microtime(true);
         $sessionId = $request->input('sessionId');
         $phoneNumber = $request->input('phoneNumber');
         $text = $request->input('text');
@@ -52,6 +54,7 @@ class UssdService
             cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
             cache()->put("ussd_{$sessionId}_phone", $phoneNumber, $this->sessionTtlSeconds());
 
+            $this->logPerformance($sessionId, 'start_menu', $startTime, ['status' => 'success']);
             return $response;
         }
 
@@ -59,30 +62,69 @@ class UssdService
             $choice = $this->currentInputValue($userInput);
 
             if ($choice == '1') {
-                return $this->startBooking($sessionId, $phoneNumber);
+                $profileCacheKey = "ussd_profile_{$phoneNumber}";
+                $profileData = cache()->remember($profileCacheKey, 300, function() use ($phoneNumber) {
+                    $result = DB::selectOne(
+                        'SELECT id, payment_pin_hash FROM public.profiles WHERE phone = ? LIMIT 1',
+                        [$phoneNumber]
+                    );
+                    return $result !== null ? (array) $result : null;
+                });
+                $profile = $profileData !== null ? (object) $profileData : null;
+
+                if ($profile === null || empty($profile->payment_pin_hash)) {
+                    return "END You must register an account and set a payment PIN before booking.\n\nDial again and select option 3 to register.";
+                }
+
+                $response = $this->startBooking($sessionId, $phoneNumber);
+                $this->logPerformance($sessionId, 'menu_booking', $startTime, ['status' => 'success']);
+                return $response;
             }
 
             if ($choice == '2') {
                 cache()->put("ussd_{$sessionId}_state", 'my_bookings', $this->sessionTtlSeconds());
                 cache()->put("ussd_{$sessionId}_my_bookings_page", 1, $this->sessionTtlSeconds());
 
-                return $this->showMyBookingsPage($sessionId, $phoneNumber, 1);
+                $response = $this->showMyBookingsPage($sessionId, $phoneNumber, 1);
+                $this->logPerformance($sessionId, 'menu_my_bookings', $startTime, ['status' => 'success']);
+                return $response;
             }
 
             if ($choice == '3') {
-                return $this->handleRegistration($sessionId, $phoneNumber, $userInput);
+                cache()->put("ussd_{$sessionId}_state", 'registration', $this->sessionTtlSeconds());
+                cache()->put("ussd_{$sessionId}_reg_step", 1, $this->sessionTtlSeconds());
+                $response = $this->handleRegistration($sessionId, $phoneNumber, $userInput);
+                $this->logPerformance($sessionId, 'menu_registration', $startTime, ['status' => 'success']);
+                return $response;
             }
 
             if ($choice == '4') {
                 cache()->forget("ussd_{$sessionId}_state");
 
+                $this->logPerformance($sessionId, 'menu_exit', $startTime, ['status' => 'success']);
                 return 'END Thank you for using TicketEase. Safe travels!';
             }
 
-            return "CON Invalid option. Please try again.\n\n1. Book Ticket\n2. My Bookings\n3. Register Account\n4. Exit";
+            $response = "CON Invalid option. Please try again.\n\n1. Book Ticket\n2. My Bookings\n3. Register Account\n4. Exit";
+            $this->logPerformance($sessionId, 'menu_invalid', $startTime, ['status' => 'error', 'reason' => 'invalid_choice']);
+            return $response;
         }
 
-        return $this->continueFlow($sessionId, $phoneNumber, $userInput, $state);
+        if ($state === 'registration') {
+            $response = $this->handleRegistration($sessionId, $phoneNumber, $userInput);
+            $this->logPerformance($sessionId, 'menu_registration', $startTime, ['status' => 'success']);
+            return $response;
+        }
+
+        $response = $this->continueFlow($sessionId, $phoneNumber, $userInput, $state);
+        $this->logPerformance($sessionId, "flow_{$state}", $startTime, ['status' => 'success']);
+        return $response;
+    }
+    private function logPerformance(string $sessionId, string $step, float $startTime, array $context = []): void
+    {
+        $duration = round((microtime(true) - $startTime) * 1000, 2);
+        $contextString = !empty($context) ? ' ' . json_encode($context) : '';
+        Log::info("USSD Performance [{$sessionId}] [{$step}]: {$duration}ms{$contextString}");
     }
 
     /**
@@ -130,24 +172,24 @@ class UssdService
             $nationalId = cache()->get("ussd_{$sessionId}_national_id");
 
             try {
-                $profileResult = DB::selectOne('SELECT public.get_or_create_profile(?, ?, ?, NULL) as id', [
-                    $fullName, $phone, $nationalId,
-                ]);
+                // Queue the expensive PIN hashing and profile update to run asynchronously
+                FinalizeUssdRegistration::dispatch(
+                    $sessionId,
+                    $phone,
+                    $fullName,
+                    $nationalId,
+                    $pin
+                );
 
-                if ($profileResult !== null && ! empty($profileResult->id)) {
-                    DB::update('UPDATE public.profiles SET payment_pin_hash = ?, updated_at = NOW() WHERE id = ?', [
-                        Hash::make($pin),
-                        (string) $profileResult->id,
-                    ]);
-                }
-
-                Log::info('USSD Registration Successful', [
+                Log::info('USSD Registration Queued for Finalization', [
                     'session_id' => $sessionId,
                     'phone' => $phone,
                     'full_name' => $fullName,
                     'national_id' => $nationalId,
+                    'status' => 'queued'
                 ]);
 
+                cache()->forget("ussd_{$sessionId}_state");
                 cache()->forget("ussd_{$sessionId}_reg_step");
                 cache()->forget("ussd_{$sessionId}_full_name");
                 cache()->forget("ussd_{$sessionId}_national_id");
@@ -181,12 +223,16 @@ class UssdService
                 $this->sessionTtlSeconds(),
                 function () {
                     $results = DB::select('SELECT DISTINCT r.route_code FROM public.routes r ORDER BY r.route_code');
-                    // Convert to simple strings to avoid serialization issues
                     return array_map(function ($row) {
                         return is_object($row) ? (string) $row->route_code : (string) $row['route_code'];
                     }, $results);
                 }
             );
+            
+            Log::info("USSD DB Fetch [{$sessionId}] [routes]: found " . count($uniqueRoutes) . " unique routes", [
+                'routes' => $uniqueRoutes,
+                'source' => cache()->has('ussd_unique_routes') ? 'cache' : 'database'
+            ]);
         } catch (\Exception $e) {
             Log::error('USSD Route Fetch Error: '.$e->getMessage());
 
@@ -198,12 +244,15 @@ class UssdService
         }
 
         // Ensure we have a clean array of strings
-        $routeCodes = array_values(array_filter(array_map(function ($route) {
-            if (is_object($route)) {
-                return property_exists($route, 'route_code') ? (string) $route->route_code : null;
+        $routeCodes = [];
+
+        foreach ($uniqueRoutes as $route) {
+            $routeCode = $this->extractRouteCode($route);
+
+            if ($routeCode !== null && $routeCode !== '') {
+                $routeCodes[] = $routeCode;
             }
-            return is_array($route) ? (string) ($route['route_code'] ?? null) : (string) $route;
-        }, $uniqueRoutes)));
+        }
 
         cache()->put("ussd_{$sessionId}_route_codes", $routeCodes, $this->sessionTtlSeconds());
 
@@ -416,6 +465,11 @@ class UssdService
                  LIMIT ? OFFSET ?',
                 [$phone, $pageSize + 1, $offset]
             );
+
+            Log::info("USSD DB Fetch [{$sessionId}] [my_bookings]: found " . count($bookings) . " bookings for {$phone}", [
+                'count' => count($bookings),
+                'page' => $page
+            ]);
         } catch (\Exception $e) {
             Log::error('USSD My Bookings Error: '.$e->getMessage(), ['phone' => $phone]);
 
@@ -481,33 +535,37 @@ class UssdService
         }
 
         try {
-            $providers = DB::select(
-                'SELECT DISTINCT t.id as tenant_id, 
-                        t.name as tenant_name, 
-                        r.id as route_id,
-                        r.base_fare,
-                        COUNT(DISTINCT trip.id) as trip_count
-                 FROM public.routes r
-                 JOIN public.tenants t ON t.id = r.tenant_id
-                 JOIN public.trips trip ON trip.route_id = r.id 
-                    AND DATE(trip.departure_datetime) = ?
-                    AND trip.status IN (?, ?)
-                 LEFT JOIN LATERAL (
-                     SELECT COUNT(*)::int AS assigned_seats
-                     FROM public.seat_assignments sa
-                     WHERE sa.trip_id = trip.id
-                 ) sa ON true
-                 LEFT JOIN public.buses b ON b.id = trip.bus_id
-                 WHERE r.route_code = ? 
-                   AND t.is_active = true
-                   AND GREATEST(
-                       COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
-                       0
-                   ) > 0
-                 GROUP BY t.id, t.name, r.id, r.base_fare
-                 ORDER BY t.name',
-                [$travelDate, 'scheduled', 'active', $selectedRouteCode]
-            );
+            // Cache provider query with date-based key to reduce database load
+            $cacheKey = "ussd_providers_{$selectedRouteCode}_{$travelDate}";
+            $providers = cache()->remember($cacheKey, 300, function () use ($selectedRouteCode, $travelDate) {
+                // Simplified query: just get providers with trip counts for the date
+                $results = DB::select(
+                    'SELECT t.id as tenant_id, 
+                           t.name as tenant_name, 
+                           r.id as route_id,
+                           r.base_fare,
+                           COUNT(trip.id) as trip_count
+                    FROM public.routes r
+                    JOIN public.tenants t ON t.id = r.tenant_id
+                    JOIN public.trips trip ON trip.route_id = r.id 
+                       AND immutable_date(trip.departure_datetime) = ?::date
+                       AND trip.status = ANY(ARRAY[\'scheduled\',\'active\'])
+                    WHERE r.route_code = ? 
+                      AND t.is_active = true
+                    GROUP BY t.id, t.name, r.id, r.base_fare
+                    ORDER BY t.name',
+                    [$travelDate, $selectedRouteCode]
+                );
+
+                // Convert stdClass objects to arrays to avoid "incomplete object" issues on serialization/unserialization
+                return array_map(fn($item) => (array) $item, $results);
+            });
+
+            Log::info("USSD DB Fetch [{$sessionId}] [providers]: found " . count($providers) . " providers for {$selectedRouteCode} on {$travelDate}", [
+                'route' => $selectedRouteCode,
+                'date' => $travelDate,
+                'count' => count($providers)
+            ]);
         } catch (\Exception $e) {
             Log::error('USSD Provider Fetch Error: '.$e->getMessage());
 
@@ -523,12 +581,14 @@ class UssdService
 
         $providerOptions = [];
         foreach ($providers as $provider) {
+            // Robustly handle either object or array
+            $p = (array) $provider;
             $providerOptions[] = [
-                'tenant_id' => (string) $provider->tenant_id,
-                'tenant_name' => (string) $provider->tenant_name,
-                'route_id' => (int) $provider->route_id,
-                'base_fare' => (float) $provider->base_fare,
-                'trip_count' => (int) $provider->trip_count,
+                'tenant_id' => (string) ($p['tenant_id'] ?? ''),
+                'tenant_name' => (string) ($p['tenant_name'] ?? ''),
+                'route_id' => (int) ($p['route_id'] ?? 0),
+                'base_fare' => (float) ($p['base_fare'] ?? 0),
+                'trip_count' => (int) ($p['trip_count'] ?? 0),
             ];
         }
 
@@ -613,39 +673,47 @@ class UssdService
         try {
             $tripOptions = cache()->remember(
                 $tripCacheKey,
-                $this->sessionTtlSeconds(),
+                300, // Cache for 5 minutes for better performance
                 function () use ($selectedRouteId, $selectedTenantId, $travelDate) {
+                    // Simplified query: get trips without complex seat calculations
                     $trips = DB::select(
                         'SELECT t.id,
-                                t.departure_datetime,
-                                t.status,
-                                GREATEST(
-                                    COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
-                                    0
-                                ) AS available_seats
-                         FROM public.trips t
-                         LEFT JOIN public.buses b ON b.id = t.bus_id
-                         LEFT JOIN LATERAL (
-                             SELECT COUNT(*)::int AS assigned_seats
-                             FROM public.seat_assignments s
-                             WHERE s.trip_id = t.id
-                         ) sa ON true
-                         WHERE t.route_id = ?
-                           AND t.tenant_id = ?
-                           AND DATE(t.departure_datetime) = ?
-                           AND t.status IN (?, ?)
-                           AND GREATEST(
-                               COALESCE(jsonb_array_length(COALESCE(b.seat_map->\'seats\', \'[]\'::jsonb)), 0) - COALESCE(sa.assigned_seats, 0),
-                               0
-                           ) > 0
-                         ORDER BY t.departure_datetime
-                         LIMIT 20',
-                        [$selectedRouteId, $selectedTenantId, $travelDate, 'scheduled', 'active']
+                               t.departure_datetime,
+                               t.status,
+                               COALESCE(jsonb_array_length(b.seat_map->\'seats\'), 0) 
+                                   - COALESCE(sa_counts.assigned, 0) as available_seats
+                        FROM public.trips t
+                        JOIN public.buses b ON b.id = t.bus_id
+                        LEFT JOIN (
+                            SELECT trip_id, COUNT(*) as assigned
+                            FROM public.seat_assignments
+                            WHERE trip_id = ANY(
+                                SELECT id FROM public.trips 
+                                WHERE route_id = ? 
+                                  AND tenant_id = ?
+                                  AND immutable_date(departure_datetime) = ?::date
+                            )
+                            GROUP BY trip_id
+                        ) sa_counts ON sa_counts.trip_id = t.id
+                        WHERE t.route_id = ?
+                          AND t.tenant_id = ?
+                          AND immutable_date(t.departure_datetime) = ?::date
+                          AND t.status = ANY(ARRAY[\'scheduled\',\'active\'])
+                        ORDER BY t.departure_datetime
+                        LIMIT 20',
+                        [$selectedRouteId, $selectedTenantId, $travelDate, $selectedRouteId, $selectedTenantId, $travelDate]
                     );
 
                     return $this->normalizeTripOptions($trips);
                 }
             );
+
+            Log::info("USSD DB Fetch [{$sessionId}] [trips]: found " . count($tripOptions) . " trips", [
+                'route_id' => $selectedRouteId,
+                'tenant_id' => $selectedTenantId,
+                'date' => $travelDate,
+                'count' => count($tripOptions)
+            ]);
         } catch (\Exception $e) {
             $tripOptions = $this->normalizeTripOptions(cache()->get($tripCacheKey, []));
 
@@ -790,21 +858,67 @@ class UssdService
             throw new \RuntimeException('Booking session expired. Please start again.');
         }
 
+        $bookingData = [
+            'route_id' => $selectedRouteId,
+            'trip_id' => $selectedTripId,
+            'tenant_id' => (string) $tenantId,
+            'route_code' => (string) $selectedRouteCode,
+            'travel_date' => (string) $travelDate,
+            'total_fare' => $baseFare * $passengerCount,
+            'passenger_count' => $passengerCount,
+            'passenger_name' => $this->resolvePassengerFullName($sessionId, $phone),
+            'payment_pin' => $enteredPin,
+        ];
+
+        $queueConnection = (string) config('queue.default', 'sync');
+        $queueConnections = (array) config('queue.connections', []);
+
+        if (! array_key_exists($queueConnection, $queueConnections)) {
+            Log::warning('USSD booking queue connection is unavailable; processing immediately', [
+                'session_id' => $sessionId,
+                'queue_connection' => $queueConnection,
+            ]);
+
+            $this->processBookingImmediately($sessionId, $phone, $bookingData);
+
+            return;
+        }
+
         ProcessUssdBooking::dispatch(
             sessionId: $sessionId,
             phone: $phone,
-            bookingData: [
-                'route_id' => $selectedRouteId,
-                'trip_id' => $selectedTripId,
-                'tenant_id' => (string) $tenantId,
-                'route_code' => (string) $selectedRouteCode,
-                'travel_date' => (string) $travelDate,
-                'total_fare' => $baseFare * $passengerCount,
-                'passenger_count' => $passengerCount,
-                'passenger_name' => $this->resolvePassengerFullName($sessionId, $phone),
-                'payment_pin' => $enteredPin,
-            ]
+            bookingData: $bookingData
         );
+    }
+
+    /**
+     * Extract a route code from a cached route payload without assuming a concrete object type.
+     *
+     * @param  mixed  $route  Cached route payload.
+     */
+    private function extractRouteCode(mixed $route): ?string
+    {
+        if (is_string($route) || is_numeric($route)) {
+            return trim((string) $route);
+        }
+
+        if (is_array($route)) {
+            $routeCode = $route['route_code'] ?? null;
+
+            return $routeCode === null ? null : trim((string) $routeCode);
+        }
+
+        if (is_object($route)) {
+            $routeArray = (array) $route;
+
+            foreach ($routeArray as $key => $value) {
+                if (str_ends_with((string) $key, 'route_code')) {
+                    return trim((string) $value);
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
