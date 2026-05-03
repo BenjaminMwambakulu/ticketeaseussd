@@ -191,11 +191,45 @@ class ProcessUssdBooking implements ShouldQueue
             ];
         });
 
-        // Fetch provider name from tenants table
-        $tenant = DB::selectOne('SELECT name FROM public.tenants WHERE id = ?', [$tenantId]);
-        $providerName = $tenant->name ?? 'Provider';
+        // Fetch provider name, bus info, and departure location
+        $tripDetails = DB::selectOne(
+            'SELECT ten.name as provider_name,
+                    b.registration_number as bus_reg,
+                    s.stage_name as departure_location
+             FROM public.trips t
+             LEFT JOIN public.tenants ten ON ten.id = t.tenant_id
+             LEFT JOIN public.buses b ON b.id = t.bus_id
+             LEFT JOIN public.stages s ON s.id = t.boarding_stage_id
+             WHERE t.id = ?',
+            [$selectedTripId]
+        );
 
-        $message = "TicketEase: Booking confirmed for {$passengerName} on {$travelDate}. Provider: {$providerName}. Ticket: {$bookingResult['ticket_number']}. Seat: {$bookingResult['seat_label']}. Route: {$routeCode}. Safe travels!";
+        $providerName = $tripDetails->provider_name ?? 'Provider';
+        $busRegistration = $tripDetails->bus_reg ?? 'N/A';
+        $departureLocation = $tripDetails->departure_location ?? 'N/A';
+
+        // Format departure time
+        $departureTime = 'N/A';
+        try {
+            $dt = \Illuminate\Support\Carbon::parse($this->bookingData['travel_date']);
+            // Get actual trip departure time from database
+            $tripTime = DB::selectOne('SELECT departure_datetime FROM public.trips WHERE id = ?', [$selectedTripId]);
+            if ($tripTime) {
+                $departureTime = \Illuminate\Support\Carbon::parse($tripTime->departure_datetime)->format('H:i');
+            }
+        } catch (\Exception $e) {
+            $departureTime = 'N/A';
+        }
+
+        $message = "TicketEase: Booking confirmed for {$passengerName}.\n";
+        $message .= "Ticket: {$bookingResult['ticket_number']}\n";
+        $message .= "Route: {$routeCode}\n";
+        $message .= "Provider: {$providerName}\n";
+        $message .= "Bus: {$busRegistration}\n";
+        $message .= "Date: {$travelDate} at {$departureTime}\n";
+        $message .= "From: {$departureLocation}\n";
+        $message .= "Seat: {$bookingResult['seat_label']}\n";
+        $message .= "Safe travels!";
 
         DB::insert(
             'INSERT INTO public.notifications (profile_id, title, message, category, metadata, tenant_id)

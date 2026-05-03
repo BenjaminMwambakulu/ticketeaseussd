@@ -290,30 +290,78 @@ class UssdService
             $selectedRouteCode = $routeCodes[$selectedIndex - 1];
             cache()->put("ussd_{$sessionId}_selected_route_code", $selectedRouteCode, $this->sessionTtlSeconds());
             cache()->put("ussd_{$sessionId}_state", 'booking_travel_date', $this->sessionTtlSeconds());
+            cache()->forget("ussd_{$sessionId}_expecting_custom_travel_date");
 
-            return 'CON Selected: '.$selectedRouteCode."\nEnter travel date (DD-MM):";
+            $response = 'CON Selected: '.$selectedRouteCode."\nChoose travel date:\n";
+            $response .= "1. Today\n2. Tomorrow\n3. Enter custom date";
+
+            return $response;
         }
 
         if ($state === 'booking_travel_date') {
             $travelDateInput = $this->currentInputValue($userInput);
+            $expectingCustom = (bool) cache()->get("ussd_{$sessionId}_expecting_custom_travel_date", false);
 
-            if (! preg_match('/^\d{2}-\d{2}$/', $travelDateInput)) {
-                return 'CON Invalid date format. Enter as DD-MM:';
+            // If we're already in the custom-entry sub-step, validate DD-MM
+            if ($expectingCustom) {
+                if (! preg_match('/^\d{2}-\d{2}$/', $travelDateInput)) {
+                    return 'CON Invalid date format. Enter as DD-MM:';
+                }
+
+                try {
+                    $travelDate = Carbon::createFromFormat('d-m', $travelDateInput)->year(Carbon::now()->year)->startOfDay();
+                } catch (\Exception $e) {
+                    return 'CON Invalid date. Enter travel date as DD-MM:';
+                }
+
+                if ($travelDate->lt(Carbon::today())) {
+                    return 'CON Travel date cannot be in the past. Enter DD-MM:';
+                }
+
+                cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
+                cache()->forget("ussd_{$sessionId}_expecting_custom_travel_date");
+
+                return $this->showProvidersForRouteAndDate($sessionId);
             }
 
-            try {
-                $travelDate = Carbon::createFromFormat('d-m', $travelDateInput)->year(Carbon::now()->year)->startOfDay();
-            } catch (\Exception $e) {
-                return 'CON Invalid date. Enter travel date as DD-MM:';
+            // Not in custom sub-step: accept quick choices or direct DD-MM input
+            if ($travelDateInput === '1') {
+                $travelDate = Carbon::today()->startOfDay();
+                cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
+
+                return $this->showProvidersForRouteAndDate($sessionId);
             }
 
-            if ($travelDate->lt(Carbon::today())) {
-                return 'CON Travel date cannot be in the past. Enter DD-MM:';
+            if ($travelDateInput === '2') {
+                $travelDate = Carbon::today()->addDay()->startOfDay();
+                cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
+
+                return $this->showProvidersForRouteAndDate($sessionId);
             }
 
-            cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
+            if ($travelDateInput === '3') {
+                cache()->put("ussd_{$sessionId}_expecting_custom_travel_date", true, $this->sessionTtlSeconds());
+                return 'CON Enter travel date (DD-MM):';
+            }
 
-            return $this->showProvidersForRouteAndDate($sessionId);
+            // Allow users to directly type a DD-MM without picking 3 first
+            if (preg_match('/^\d{2}-\d{2}$/', $travelDateInput)) {
+                try {
+                    $travelDate = Carbon::createFromFormat('d-m', $travelDateInput)->year(Carbon::now()->year)->startOfDay();
+                } catch (\Exception $e) {
+                    return 'CON Invalid date. Enter travel date as DD-MM:';
+                }
+
+                if ($travelDate->lt(Carbon::today())) {
+                    return 'CON Travel date cannot be in the past. Enter DD-MM:';
+                }
+
+                cache()->put("ussd_{$sessionId}_travel_date", $travelDate->toDateString(), $this->sessionTtlSeconds());
+
+                return $this->showProvidersForRouteAndDate($sessionId);
+            }
+
+            return 'CON Invalid option. Choose travel date:\n1. Today\n2. Tomorrow\n3. Enter custom date';
         }
 
         if ($state === 'booking_provider') {
@@ -400,30 +448,39 @@ class UssdService
         if ($state === 'my_bookings') {
             $choice = $this->currentInputValue($userInput);
 
-            if ($choice === '1') {
-                $nextPage = ((int) cache()->get("ussd_{$sessionId}_my_bookings_page", 1)) + 1;
-                cache()->put("ussd_{$sessionId}_my_bookings_page", $nextPage, $this->sessionTtlSeconds());
-
-                return $this->showMyBookingsPage($sessionId, $phone, $nextPage);
+            // Check if user selected a specific booking (numbered 1, 2, 3, etc.)
+            $bookingsList = cache()->get("ussd_{$sessionId}_my_bookings_list", []);
+            
+            if (!empty($bookingsList) && is_numeric($choice) && $choice >= 1 && $choice <= count($bookingsList)) {
+                $selectedBooking = $bookingsList[$choice - 1];
+                return $this->sendBookingDetailsSMS($sessionId, $phone, $selectedBooking);
             }
 
-            if ($choice === '2') {
+            if ($choice === '0' || $choice === '9') {
+                // Go back or main menu
                 cache()->forget("ussd_{$sessionId}_my_bookings_page");
+                cache()->forget("ussd_{$sessionId}_my_bookings_list");
                 cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
 
                 return "CON Welcome to TicketEase!\n\n1. Book Ticket\n2. My Bookings\n3. Register Account\n4. Exit";
             }
 
-            return 'CON Invalid option.\n1. More\n2. Main Menu';
+            // Load next page of bookings
+            $nextPage = ((int) cache()->get("ussd_{$sessionId}_my_bookings_page", 1)) + 1;
+            cache()->put("ussd_{$sessionId}_my_bookings_page", $nextPage, $this->sessionTtlSeconds());
+
+            return $this->showMyBookingsPage($sessionId, $phone, $nextPage);
         }
 
         return 'CON Feature coming soon...';
     }
 
     /**
-     * Show recent bookings for the caller phone number.
+     * Show recent bookings for the caller phone number with concise summary.
      *
+     * @param  string  $sessionId  USSD session identifier.
      * @param  string|null  $phone  Caller MSISDN supplied by the gateway.
+     * @param  int  $page  Page number for pagination.
      * @return string Booking list response.
      */
     private function showMyBookingsPage(string $sessionId, ?string $phone, int $page): string
@@ -432,22 +489,24 @@ class UssdService
             return 'END Unable to identify your phone number. Please try again.';
         }
 
-        $pageSize = 3;
+        $pageSize = 5;
         $offset = max($page - 1, 0) * $pageSize;
 
         try {
             $bookings = DB::select(
-                'SELECT bp.ticket_number,
+                'SELECT bp.id as passenger_id,
+                        bp.ticket_number,
                         b.status,
                         r.route_code,
                         t.departure_datetime,
                         sa.seat_label,
-                        b.created_at
+                        ten.name as provider_name
                  FROM public.booking_passengers bp
                  JOIN public.bookings b ON b.id = bp.booking_id
                  LEFT JOIN public.routes r ON r.id = b.route_id
                  LEFT JOIN public.trips t ON t.id = b.trip_id
                  LEFT JOIN public.seat_assignments sa ON sa.booking_passenger_id = bp.id
+                 LEFT JOIN public.tenants ten ON ten.id = b.tenant_id
                  WHERE bp.contact_phone = ?
                  ORDER BY b.created_at DESC
                  LIMIT ? OFFSET ?',
@@ -466,6 +525,7 @@ class UssdService
 
         if (empty($bookings)) {
             cache()->forget("ussd_{$sessionId}_my_bookings_page");
+            cache()->forget("ussd_{$sessionId}_my_bookings_list");
             cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
 
             return 'END No bookings found for your number yet.';
@@ -474,35 +534,141 @@ class UssdService
         $hasMore = count($bookings) > $pageSize;
         $visibleBookings = array_slice($bookings, 0, $pageSize);
 
-        $response = "CON My Bookings\n";
+        // Store bookings in cache for selection
+        $bookingsForSelection = [];
+        foreach ($visibleBookings as $booking) {
+            $bookingsForSelection[] = [
+                'passenger_id' => $booking->passenger_id,
+                'ticket_number' => $booking->ticket_number,
+                'route_code' => $booking->route_code,
+                'departure_datetime' => $booking->departure_datetime,
+                'seat_label' => $booking->seat_label,
+                'status' => $booking->status,
+                'provider_name' => $booking->provider_name,
+            ];
+        }
+        cache()->put("ussd_{$sessionId}_my_bookings_list", $bookingsForSelection, $this->sessionTtlSeconds());
+
+        $response = "CON Your Bookings:\n";
 
         foreach ($visibleBookings as $index => $booking) {
             $travelDate = 'N/A';
+            $departureTime = '';
 
             if (! empty($booking->departure_datetime)) {
                 try {
-                    $travelDate = Carbon::parse($booking->departure_datetime)->format('d-m-Y H:i');
+                    $dt = Carbon::parse($booking->departure_datetime);
+                    $travelDate = $dt->format('d-m-Y');
+                    $departureTime = ' ' . $dt->format('H:i');
                 } catch (\Exception $e) {
                     $travelDate = 'N/A';
                 }
             }
 
             $ticketNumber = (string) ($booking->ticket_number ?? 'N/A');
-            $routeCode = (string) ($booking->route_code ?? 'Unknown Route');
-            $seatLabel = (string) ($booking->seat_label ?? 'Unassigned');
+            $routeCode = (string) ($booking->route_code ?? 'Unknown');
             $status = strtoupper((string) ($booking->status ?? 'unknown'));
 
-            $response .= '- '.$ticketNumber.' | '.$routeCode."\n";
-            $response .= '   '.$travelDate.' | Seat: '.$seatLabel.' | '.$status."\n";
+            // Concise format: 1. TE-XXX | Route | Date Time | Status
+            $response .= ($index + 1).'. '.$ticketNumber.' | '.$routeCode.' | '.$travelDate.$departureTime.' | '.$status."\n";
         }
 
+        $response .= "\nSelect # for details or 0 for menu";
+
         if ($hasMore) {
-            $response .= "1. More\n2. Main Menu";
-        } else {
-            $response .= '2. Main Menu';
+            $response .= "\n* for more";
         }
 
         return rtrim($response);
+    }
+
+    /**
+     * Send detailed booking information via SMS when user selects a booking.
+     *
+     * @param  string  $sessionId  USSD session identifier.
+     * @param  string  $phone  Caller MSISDN.
+     * @param  array  $booking  Selected booking data.
+     * @return string USSD response confirming SMS sent.
+     */
+    private function sendBookingDetailsSMS(string $sessionId, string $phone, array $booking): string
+    {
+        try {
+            $travelDate = 'N/A';
+            $departureTime = 'N/A';
+            $busRegistration = 'N/A';
+            $departureLocation = 'N/A';
+
+            if (! empty($booking['departure_datetime'])) {
+                try {
+                    $dt = Carbon::parse($booking['departure_datetime']);
+                    $travelDate = $dt->format('d-m-Y');
+                    $departureTime = $dt->format('H:i');
+                } catch (\Exception $e) {
+                    // Keep defaults
+                }
+            }
+
+            // Fetch bus and departure location details from database
+            if (! empty($booking['passenger_id'])) {
+                $tripDetails = DB::selectOne(
+                    'SELECT b.registration_number as bus_reg,
+                            s.stage_name as departure_location
+                     FROM public.booking_passengers bp
+                     JOIN public.bookings bk ON bk.id = bp.booking_id
+                     JOIN public.trips t ON t.id = bk.trip_id
+                     LEFT JOIN public.buses b ON b.id = t.bus_id
+                     LEFT JOIN public.stages s ON s.id = t.boarding_stage_id
+                     WHERE bp.id = ?',
+                    [$booking['passenger_id']]
+                );
+
+                if ($tripDetails) {
+                    $busRegistration = $tripDetails->bus_reg ?? 'N/A';
+                    $departureLocation = $tripDetails->departure_location ?? 'N/A';
+                }
+            }
+
+            $ticketNumber = (string) ($booking['ticket_number'] ?? 'N/A');
+            $routeCode = (string) ($booking['route_code'] ?? 'Unknown Route');
+            $seatLabel = (string) ($booking['seat_label'] ?? 'Unassigned');
+            $status = strtoupper((string) ($booking['status'] ?? 'unknown'));
+            $providerName = (string) ($booking['provider_name'] ?? 'Provider');
+
+            $message = "TicketEase Booking Details:\n";
+            $message .= "Ticket: {$ticketNumber}\n";
+            $message .= "Route: {$routeCode}\n";
+            $message .= "Provider: {$providerName}\n";
+            $message .= "Bus: {$busRegistration}\n";
+            $message .= "Date: {$travelDate} at {$departureTime}\n";
+            $message .= "From: {$departureLocation}\n";
+            $message .= "Seat: {$seatLabel}\n";
+            $message .= "Status: {$status}\n";
+            $message .= "Safe travels!";
+
+            // Send SMS
+            $this->smsService->send([$phone], $message);
+
+            Log::info('USSD Booking Details SMS Sent', [
+                'session_id' => $sessionId,
+                'phone' => $phone,
+                'ticket' => $ticketNumber,
+            ]);
+
+            // Return to main menu
+            cache()->forget("ussd_{$sessionId}_my_bookings_page");
+            cache()->forget("ussd_{$sessionId}_my_bookings_list");
+            cache()->put("ussd_{$sessionId}_state", 'menu', $this->sessionTtlSeconds());
+
+            return "END Booking details sent to {$phone}.\n\nThank you for using TicketEase!";
+        } catch (\Throwable $e) {
+            Log::error('Failed to send booking details SMS', [
+                'session_id' => $sessionId,
+                'phone' => $phone,
+                'error' => $e->getMessage(),
+            ]);
+
+            return 'END Sorry, could not send booking details. Please try again.';
+        }
     }
 
     /**
