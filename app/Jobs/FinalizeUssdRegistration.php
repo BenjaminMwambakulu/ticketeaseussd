@@ -36,14 +36,12 @@ class FinalizeUssdRegistration implements ShouldQueue
      * @param string $sessionId USSD session ID for logging.
      * @param string $phone User's phone number.
      * @param string $fullName User's full name.
-     * @param string $nationalId User's national ID.
      * @param string $pin The plain-text 4-digit payment PIN to hash and store.
      */
     public function __construct(
         protected string $sessionId,
         protected string $phone,
         protected string $fullName,
-        protected string $nationalId,
         protected string $pin
     ) {
         $this->onQueue('registrations');
@@ -61,9 +59,9 @@ class FinalizeUssdRegistration implements ShouldQueue
         ]);
 
         try {
-            // Get or create the profile
+            // Get or create the profile (passing NULL for national_id)
             $profileResult = DB::selectOne('SELECT public.get_or_create_profile(?, ?, ?, NULL) as id', [
-                $this->fullName, $this->phone, $this->nationalId,
+                $this->fullName, $this->phone, null,
             ]);
 
             if ($profileResult === null || empty($profileResult->id)) {
@@ -84,7 +82,6 @@ class FinalizeUssdRegistration implements ShouldQueue
                 'session_id' => $this->sessionId,
                 'phone' => $this->phone,
                 'full_name' => $this->fullName,
-                'national_id' => $this->nationalId,
                 'profile_id' => $profileResult->id,
                 'db_operation' => 'get_or_create_profile + hash_pin',
                 'status' => 'success'

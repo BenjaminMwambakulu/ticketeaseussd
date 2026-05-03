@@ -128,7 +128,7 @@ class UssdService
     }
 
     /**
-     * Run the multi-step registration flow (name -> national ID -> profile create/get).
+     * Run the multi-step registration flow (name -> profile create/get).
      *
      * @param  string  $sessionId  USSD session identifier.
      * @param  string|null  $phone  Caller MSISDN supplied by the gateway.
@@ -150,18 +150,10 @@ class UssdService
             cache()->put("ussd_{$sessionId}_full_name", $fullName, $this->sessionTtlSeconds());
             cache()->put("ussd_{$sessionId}_reg_step", 3, $this->sessionTtlSeconds());
 
-            return 'CON Enter your National ID:';
-        }
-
-        if ($step == 3) {
-            $nationalId = $this->currentInputValue($userInput);
-            cache()->put("ussd_{$sessionId}_national_id", $nationalId, $this->sessionTtlSeconds());
-            cache()->put("ussd_{$sessionId}_reg_step", 4, $this->sessionTtlSeconds());
-
             return 'CON Set a 4-digit payment PIN:';
         }
 
-        if ($step == 4) {
+        if ($step == 3) {
             $pin = $this->currentInputValue($userInput);
 
             if (! preg_match('/^\d{4}$/', $pin)) {
@@ -169,7 +161,6 @@ class UssdService
             }
 
             $fullName = cache()->get("ussd_{$sessionId}_full_name");
-            $nationalId = cache()->get("ussd_{$sessionId}_national_id");
 
             try {
                 // Queue the expensive PIN hashing and profile update to run asynchronously
@@ -177,7 +168,6 @@ class UssdService
                     $sessionId,
                     $phone,
                     $fullName,
-                    $nationalId,
                     $pin
                 );
 
@@ -185,14 +175,12 @@ class UssdService
                     'session_id' => $sessionId,
                     'phone' => $phone,
                     'full_name' => $fullName,
-                    'national_id' => $nationalId,
                     'status' => 'queued'
                 ]);
 
                 cache()->forget("ussd_{$sessionId}_state");
                 cache()->forget("ussd_{$sessionId}_reg_step");
                 cache()->forget("ussd_{$sessionId}_full_name");
-                cache()->forget("ussd_{$sessionId}_national_id");
 
                 return "END Registration successful!\nYour account is now active.\nDial again to book tickets.";
             } catch (\Exception $e) {
@@ -782,20 +770,17 @@ class UssdService
     }
 
     /**
-     * Resolve the selected route label from cached route options.
+     * Resolve the selected route label from cached route code.
      *
      * @param  string  $sessionId  USSD session identifier.
      * @return string Selected route label or placeholder if not available.
      */
     private function selectedRouteLabel(string $sessionId): string
     {
-        $selectedRouteId = cache()->get("ussd_{$sessionId}_selected_route_id");
-        $routeOptions = $this->normalizeRouteOptions(cache()->get("ussd_{$sessionId}_route_options", []));
-
-        foreach ($routeOptions as $route) {
-            if ((string) ($route['id'] ?? '') === (string) $selectedRouteId) {
-                return $route['display_label'];
-            }
+        $selectedRouteCode = cache()->get("ussd_{$sessionId}_selected_route_code");
+        
+        if ($selectedRouteCode && $selectedRouteCode !== '') {
+            return (string) $selectedRouteCode;
         }
 
         return 'Unknown Route';
