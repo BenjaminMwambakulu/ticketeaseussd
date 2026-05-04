@@ -12,33 +12,42 @@ class LogViewerController extends Controller
      */
     public function index(Request $request)
     {
-        $logFile = storage_path('logs/laravel.log');
-        
-        if (!File::exists($logFile)) {
-            return view('log-viewer', [
-                'logs' => [],
-                'error' => 'Log file not found',
-                'currentFile' => 'laravel.log'
-            ]);
+        // Get all log files first
+        $logFiles = [];
+        if (File::exists(storage_path('logs'))) {
+            $files = File::files(storage_path('logs'));
+            $logFiles = array_map(function ($file) {
+                return $file->getFilename();
+            }, $files);
+            
+            // Filter to only .log files
+            $logFiles = array_values(array_filter($logFiles, function ($file) {
+                return str_ends_with($file, '.log');
+            }));
         }
-
-        // Get all log files
-        $logFiles = File::files(storage_path('logs'));
-        $logFiles = array_map(function ($file) {
-            return $file->getFilename();
-        }, $logFiles);
-        
-        // Filter to only .log files
-        $logFiles = array_filter($logFiles, function ($file) {
-            return str_ends_with($file, '.log');
-        });
 
         $selectedFile = $request->input('file', 'laravel.log');
         $logPath = storage_path('logs/' . $selectedFile);
 
         if (!File::exists($logPath)) {
-            $selectedFile = 'laravel.log';
-            $logPath = storage_path('logs/laravel.log');
+            // If selected file doesn't exist, try laravel.log
+            if (File::exists(storage_path('logs/laravel.log'))) {
+                $selectedFile = 'laravel.log';
+                $logPath = storage_path('logs/laravel.log');
+            } else {
+                // No log files exist
+                return view('log-viewer', [
+                    'logs' => [],
+                    'allLogs' => [],
+                    'totalLogs' => 0,
+                    'currentPage' => 1,
+                    'totalPages' => 0,
+                    'perPage' => 50,
+                    'logFiles' => $logFiles,
+                    'currentFile' => $selectedFile,
+                    'error' => 'No log files found in storage/logs/'
+                ]);
+            }
         }
 
         // Read and parse logs
@@ -48,7 +57,7 @@ class LogViewerController extends Controller
         $perPage = 50;
         $currentPage = $request->input('page', 1);
         $totalLogs = count($logs);
-        $totalPages = ceil($totalLogs / $perPage);
+        $totalPages = max(1, ceil($totalLogs / $perPage));
         $offset = ($currentPage - 1) * $perPage;
         $paginatedLogs = array_slice($logs, $offset, $perPage);
 
