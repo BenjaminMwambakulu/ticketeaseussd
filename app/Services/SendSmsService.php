@@ -3,47 +3,50 @@
 namespace App\Services;
 
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 
-class SendSmsService {
-
-    private const BASE_URL = 'https://api.textbee.dev/api/v1';
+class SendSmsService
+{
+    private const BASE_URL = 'https://api.httpsms.com/v1';
 
     private string $apiKey;
-    private string $deviceId;
     private string $baseUrl;
 
     public function __construct()
     {
-        $this->apiKey = config('services.textbee.api_key');
-        $this->deviceId = config('services.textbee.device_id');
+        $this->apiKey  = config('services.textbee.api_key');
         $this->baseUrl = rtrim((string) config('services.textbee.base_url', self::BASE_URL), '/');
     }
 
-    /**
-     * Send SMS via TextBee API
-     */
     public function send(array $recipients, string $message)
     {
-        $response = Http::timeout((int) config('services.textbee.timeout_seconds', 15))
-            ->connectTimeout((int) config('services.textbee.connect_timeout_seconds', 10))
-            ->retry((int) config('services.textbee.http_retries', 1), 200)
-            ->withHeaders([
-                'x-api-key' => $this->apiKey,
-                'Content-Type' => 'application/json',
-            ])->post(
-                $this->baseUrl . "/gateway/devices/{$this->deviceId}/send-sms",
-                [
-                    'recipients' => $recipients,
-                    'message' => $message,
-                ]
-            );
+        $responses = [];
 
-        \Illuminate\Support\Facades\Log::info('TextBee SMS Response', [
-            'status' => $response->status(),
-            'body' => $response->json(),
-            'recipients' => $recipients
-        ]);
+        foreach ($recipients as $to) {
+            $response = Http::timeout(15)
+                ->connectTimeout(10)
+                ->retry(2, 300)
+                ->withHeaders([
+                    'x-api-key'     => $this->apiKey,
+                    'Content-Type'  => 'application/json',
+                    'Accept'        => 'application/json',
+                ])
+                ->post("{$this->baseUrl}/messages/send", [
+                    'content' => $message,
+                    'from'    => config('services.textbee.from_number'), // ← Very important
+                    'to'      => $to,
+                ]);
 
-        return $response;
+            Log::info('httpSMS Send Response', [
+                'status'    => $response->status(),
+                'body'      => $response->json(),
+                'to'        => $to,
+                'full_url'  => "{$this->baseUrl}/messages/send",   // For debugging
+            ]);
+
+            $responses[] = $response;
+        }
+
+        return count($responses) === 1 ? $responses[0] : $responses;
     }
 }

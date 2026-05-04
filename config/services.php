@@ -42,6 +42,7 @@ return [
         'timeout_seconds' => env('TEXTBEE_TIMEOUT_SECONDS', 5),
         'connect_timeout_seconds' => env('TEXTBEE_CONNECT_TIMEOUT_SECONDS', 2),
         'http_retries' => env('TEXTBEE_HTTP_RETRIES', 1),
+        'from_number' => '+265885705304'
     ],
 
 ];

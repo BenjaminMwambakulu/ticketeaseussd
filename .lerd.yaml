@@ -1,0 +1,9 @@
+domains:
+    - ticketeaseussd
+php_version: "8.5"
+framework: laravel
+framework_version: "13"
+services:
+    - postgres
+workers:
+    - queue
