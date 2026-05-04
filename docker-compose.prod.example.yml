@@ -1,0 +1,43 @@
+# Production Docker Compose Configuration
+# Copy this to docker-compose.prod.yml and modify as needed
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+version: '3.8'
+
+services:
+  app:
+    environment:
+      - APP_ENV=production
+      - APP_DEBUG=false
+      # Add Redis password in production
+      # - REDIS_PASSWORD=your_secure_redis_password
+    # Remove volume mounts in production for better performance
+    # volumes:
+    #   - ./storage:/var/www/html/storage
+    
+  db:
+    environment:
+      # Use strong passwords in production
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?You must set DB_ROOT_PASSWORD}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?You must set DB_PASSWORD}
+    # Restrict port access in production
+    ports:
+      - "127.0.0.1:3306:3306"
+    
+  redis:
+    # Add password protection in production
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    ports:
+      - "127.0.0.1:6379:6379"
+    
+  queue:
+    environment:
+      # Add Redis password if set
+      # - REDIS_PASSWORD=your_secure_redis_password
+    restart: always
+    
+  scheduler:
+    environment:
+      # Add Redis password if set
+      # - REDIS_PASSWORD=your_secure_redis_password
+    restart: always

@@ -1,0 +1,132 @@
+version: '3.8'
+
+services:
+  # Laravel Application (PHP-FPM + Nginx)
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ticketease_app
+    restart: unless-stopped
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+      - ./storage:/var/www/html/storage
+    environment:
+      - APP_ENV=${APP_ENV:-local}
+      - APP_DEBUG=${APP_DEBUG:-true}
+      - APP_KEY=${APP_KEY}
+      - APP_URL=${APP_URL:-http://localhost}
+      - DB_CONNECTION=pgsql
+      - DB_HOST=${DB_HOST:-aws-1-eu-west-1.pooler.supabase.com}
+      - DB_PORT=${DB_PORT:-6543}
+      - DB_DATABASE=${DB_DATABASE:-postgres}
+      - DB_USERNAME=${DB_USERNAME:-postgres.aqjfskbmiycsebzegtys}
+      - DB_PASSWORD=${DB_PASSWORD:-oHR64n0Upxj2rcjd}
+      - DB_SSLMODE=${DB_SSLMODE:-require}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - QUEUE_CONNECTION=redis
+      - CACHE_STORE=redis
+      - SESSION_DRIVER=redis
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - ticketease_network
+    ports:
+      - "80:80"
+      - "443:443"
+
+
+  # Redis (Cache + Queue)
+  redis:
+    image: redis:7-alpine
+    container_name: ticketease_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      timeout: 5s
+      retries: 5
+    networks:
+      - ticketease_network
+
+  # Queue Worker
+  queue:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ticketease_queue
+    restart: unless-stopped
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+    environment:
+      - APP_ENV=${APP_ENV:-local}
+      - APP_DEBUG=${APP_DEBUG:-true}
+      - APP_KEY=${APP_KEY}
+      - DB_CONNECTION=pgsql
+      - DB_HOST=${DB_HOST:-aws-1-eu-west-1.pooler.supabase.com}
+      - DB_PORT=${DB_PORT:-6543}
+      - DB_DATABASE=${DB_DATABASE:-postgres}
+      - DB_USERNAME=${DB_USERNAME:-postgres.aqjfskbmiycsebzegtys}
+      - DB_PASSWORD=${DB_PASSWORD:-oHR64n0Upxj2rcjd}
+      - DB_SSLMODE=${DB_SSLMODE:-require}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - QUEUE_CONNECTION=redis
+      - CACHE_STORE=redis
+    command: php artisan queue:work --tries=3 --timeout=90
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - ticketease_network
+
+  # Laravel Scheduler (optional)
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ticketease_scheduler
+    restart: unless-stopped
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+    environment:
+      - APP_ENV=${APP_ENV:-local}
+      - APP_DEBUG=${APP_DEBUG:-true}
+      - APP_KEY=${APP_KEY}
+      - DB_CONNECTION=pgsql
+      - DB_HOST=${DB_HOST:-aws-1-eu-west-1.pooler.supabase.com}
+      - DB_PORT=${DB_PORT:-6543}
+      - DB_DATABASE=${DB_DATABASE:-postgres}
+      - DB_USERNAME=${DB_USERNAME:-postgres.aqjfskbmiycsebzegtys}
+      - DB_PASSWORD=${DB_PASSWORD:-oHR64n0Upxj2rcjd}
+      - DB_SSLMODE=${DB_SSLMODE:-require}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - QUEUE_CONNECTION=redis
+      - CACHE_STORE=redis
+    command: php artisan schedule:run
+    depends_on:
+      redis:
+        condition: service_started
+    networks:
+      - ticketease_network
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  ticketease_network:
+    driver: bridge
