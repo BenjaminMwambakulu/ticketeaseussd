@@ -50,14 +50,27 @@ class ProcessUssdBooking implements ShouldQueue
     }
 
     /**
+     * Get the middleware the job should pass through.
+     *
+     * @return array<int, object>
+     */
+    public function middleware(): array
+    {
+        return [new \App\Queue\Middleware\TrackJobExecution()];
+    }
+
+    /**
      * Execute the job.
      */
     public function handle(SendSmsService $smsService): void
     {
+        $startTime = microtime(true);
+        
         Log::info('Processing USSD Booking Job', [
             'session_id' => $this->sessionId,
             'phone' => $this->phone,
             'trip_id' => $this->bookingData['trip_id'] ?? 'unknown',
+            'job_started_at' => now()->toDateTimeString(),
         ]);
 
         $selectedRouteId = $this->bookingData['route_id'];
@@ -256,6 +269,7 @@ class ProcessUssdBooking implements ShouldQueue
                 'session_id' => $this->sessionId,
                 'phone' => $this->phone,
                 'error' => $smsError->getMessage(),
+                'execution_time_seconds' => round(microtime(true) - $startTime, 3),
             ]);
         }
 
@@ -263,6 +277,7 @@ class ProcessUssdBooking implements ShouldQueue
             'session_id' => $this->sessionId,
             'ticket' => $bookingResult['ticket_number'],
             'seat' => $bookingResult['seat_label'],
+            'execution_time_seconds' => round(microtime(true) - $startTime, 3),
         ]);
     }
 }

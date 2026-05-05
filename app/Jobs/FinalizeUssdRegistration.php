@@ -48,14 +48,27 @@ class FinalizeUssdRegistration implements ShouldQueue
     }
 
     /**
+     * Get the middleware the job should pass through.
+     *
+     * @return array<int, object>
+     */
+    public function middleware(): array
+    {
+        return [new \App\Queue\Middleware\TrackJobExecution()];
+    }
+
+    /**
      * Execute the job.
      */
     public function handle(\App\Services\SendSmsService $smsService): void
     {
+        $startTime = microtime(true);
+        
         Log::info('Finalizing USSD Registration', [
             'session_id' => $this->sessionId,
             'phone' => $this->phone,
             'full_name' => $this->fullName,
+            'job_started_at' => now()->toDateTimeString(),
         ]);
 
         try {
@@ -84,7 +97,8 @@ class FinalizeUssdRegistration implements ShouldQueue
                 'full_name' => $this->fullName,
                 'profile_id' => $profileResult->id,
                 'db_operation' => 'get_or_create_profile + hash_pin',
-                'status' => 'success'
+                'status' => 'success',
+                'execution_time_seconds' => round(microtime(true) - $startTime, 3),
             ]);
 
             // Send welcome SMS
@@ -104,6 +118,7 @@ class FinalizeUssdRegistration implements ShouldQueue
                 'session_id' => $this->sessionId,
                 'phone' => $this->phone,
                 'exception' => $e,
+                'execution_time_seconds' => round(microtime(true) - $startTime, 3),
             ]);
         }
     }
