@@ -83,7 +83,7 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - QUEUE_CONNECTION=redis
       - CACHE_STORE=redis
-    command: php artisan queue:work --tries=3 --timeout=90
+    command: php artisan queue:work redis --queue=registrations,bookings --tries=3 --timeout=90
     depends_on:
       redis:
         condition: service_started
