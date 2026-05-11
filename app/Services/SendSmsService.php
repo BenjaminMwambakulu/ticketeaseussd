@@ -78,13 +78,14 @@ class SendSmsService
     /**
      * Split a message into parts if it exceeds 160 characters.
      * Each part will be prefixed with a sequence indicator if there are multiple parts.
+     * Uses 120 character limit per part for maximum delivery reliability.
      *
      * @param string $message The original message
      * @return array Array of message parts
      */
     private function splitMessage(string $message): array
     {
-        $maxLength = 160;
+        $maxLength = 120; // Reduced for maximum reliability
 
         if (strlen($message) <= $maxLength) {
             return [$message];
